@@ -808,6 +808,10 @@ impl Scheduler for Qwen35Scheduler {
                 as u64,
             num_waiting_reqs: self.pending.len() as u64,
             spec_decode: None,
+            // Hybrid Gated DeltaNet state is linear and not prefix-reusable, so
+            // this line has no prefix cache to count.
+            prefix_cache_queries: 0,
+            prefix_cache_hits: 0,
         }
     }
 }
