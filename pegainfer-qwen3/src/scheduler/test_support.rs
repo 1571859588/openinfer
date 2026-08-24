@@ -65,6 +65,14 @@ pub(crate) struct FakeExecutor {
     emit_logprobs: bool,
     async_prefill: Option<Arc<AsyncPrefillGate>>,
     parked_prefill: Option<PrefillResult>,
+    // When > 0, the first prefill chunk of every request reports this many
+    // `cached_tokens` (a simulated prefix-cache hit). Drives the prefix-cache
+    // query/hit counters without a real GPU KV cache.
+    prefix_hit_tokens: usize,
+    // Whether the fake executor claims to consult a prefix cache at all.
+    // `false` models a real executor with prefix caching switched off, which
+    // never calls `match_and_add_prefix` and must therefore report no queries.
+    prefix_cache_enabled: bool,
 }
 
 impl FakeExecutor {
@@ -87,6 +95,8 @@ impl FakeExecutor {
             emit_logprobs: false,
             async_prefill: None,
             parked_prefill: None,
+            prefix_hit_tokens: 0,
+            prefix_cache_enabled: true,
         }
     }
 
@@ -97,6 +107,20 @@ impl FakeExecutor {
 
     pub(crate) fn with_async_prefill(mut self, gate: Arc<AsyncPrefillGate>) -> Self {
         self.async_prefill = Some(gate);
+        self
+    }
+
+    /// Simulate a prefix-cache hit on every request's first prefill chunk by
+    /// reporting `tokens` cached tokens.
+    pub(crate) fn with_prefix_hit(mut self, tokens: usize) -> Self {
+        self.prefix_hit_tokens = tokens;
+        self
+    }
+
+    /// Model an executor that never consults a prefix cache (caching switched
+    /// off): no `match_and_add_prefix` happens, so no query may be counted.
+    pub(crate) fn without_prefix_cache(mut self) -> Self {
+        self.prefix_cache_enabled = false;
         self
     }
 
@@ -160,7 +184,14 @@ impl FakeExecutor {
                 }
             }),
             prompt_logprobs: None,
-            cached_tokens: 0,
+            // A simulated prefix-cache hit is reported only on the request's
+            // first chunk (start == 0); later chunks carry no cached prefix.
+            // With the cache off nothing is matched, so no token is cached.
+            cached_tokens: if start == 0 && self.prefix_cache_enabled {
+                self.prefix_hit_tokens
+            } else {
+                0
+            },
             completed,
             prefill_pos,
         }
@@ -209,6 +240,10 @@ impl ModelExecutor for FakeExecutor {
 
     fn max_decode_batch_size(&self) -> usize {
         self.max_decode_batch_size
+    }
+
+    fn prefix_cache_enabled(&self) -> bool {
+        self.prefix_cache_enabled
     }
 
     fn available_blocks(&self) -> usize {
