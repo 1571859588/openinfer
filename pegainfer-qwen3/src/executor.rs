@@ -841,6 +841,15 @@ pub(crate) trait ModelExecutor: Send {
     fn is_stop_token(&self, token_id: u32) -> bool;
     fn drop_request(&mut self, request_id: RequestId) -> Result<()>;
 
+    /// Whether this executor actually consults a prefix cache for a non-echo
+    /// request. Executors without one — or with it switched off — must report
+    /// `false`: the `/metrics` prefix-cache counters are derived from this, and
+    /// must not record lookups that never happened (a disabled cache or an echo
+    /// request never calls `match_and_add_prefix`).
+    fn prefix_cache_enabled(&self) -> bool {
+        true
+    }
+
     fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult>;
     fn execute_decode(&mut self, plan: DecodePlan<'_>) -> Result<DecodeResult>;
     fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult>;
@@ -2314,6 +2323,13 @@ fn ensure_lora_capacity(
 impl ModelExecutor for Qwen3Executor {
     fn block_size(&self) -> usize {
         self.metadata.block_size
+    }
+
+    /// Delegate to the inherent method of the same name, which also folds in
+    /// the speculative-decoding override. Spelled out so the delegation cannot
+    /// be mistaken for recursion.
+    fn prefix_cache_enabled(&self) -> bool {
+        Qwen3Executor::prefix_cache_enabled(self)
     }
 
     fn max_request_blocks(&self) -> usize {
