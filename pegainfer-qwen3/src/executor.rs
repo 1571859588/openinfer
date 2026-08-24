@@ -742,6 +742,15 @@ pub(crate) trait ModelExecutor: Send {
     fn is_stop_token(&self, token_id: u32) -> bool;
     fn drop_request(&mut self, request_id: RequestId) -> Result<()>;
 
+    /// Whether this executor actually consults a prefix cache for a non-echo
+    /// request. Executors without one — or with it switched off — must report
+    /// `false`: the `/metrics` prefix-cache counters are derived from this, and
+    /// must not record lookups that never happened (a disabled cache or an echo
+    /// request never calls `match_and_add_prefix`).
+    fn prefix_cache_enabled(&self) -> bool {
+        true
+    }
+
     fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult>;
     fn execute_decode(&mut self, plan: DecodePlan<'_>) -> Result<DecodeResult>;
     fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult>;
@@ -1800,7 +1809,16 @@ impl Qwen3Executor {
             // Prompt scoring needs logits for every prompt position; cached positions
             // are never forwarded, so prompt-logprob requests prefill from scratch.
             if self.prefix_cache_enabled() && req.prompt_logprobs.is_none() {
-                req.cached_tokens = rkv.match_and_add_prefix(self.kv_mgr.pool())?;
+                let matched = rkv.match_and_add_prefix(self.kv_mgr.pool())?;
+                // Split the match by origin: blocks the probe found in local
+                // GPU KV versus blocks it restored from CPU offload / P2P.
+                // With no probe for this request the whole match is local.
+                let block_size = self.metadata.block_size;
+                let local = self.prefetch.get(&req.request_id).map_or(matched, |probe| {
+                    (probe.gpu_hit_blocks() * block_size).min(matched)
+                });
+                req.cached_tokens = Some(matched);
+                req.external_hit_tokens = matched.saturating_sub(local);
             }
             self.request_kvs.insert(req.request_id, rkv);
             // match_and_add_prefix above already absorbed any CPU-prefetched
@@ -2220,6 +2238,13 @@ fn ensure_lora_capacity(
 impl ModelExecutor for Qwen3Executor {
     fn block_size(&self) -> usize {
         self.metadata.block_size
+    }
+
+    /// Delegate to the inherent method of the same name, which also folds in
+    /// the speculative-decoding override. Spelled out so the delegation cannot
+    /// be mistaken for recursion.
+    fn prefix_cache_enabled(&self) -> bool {
+        Qwen3Executor::prefix_cache_enabled(self)
     }
 
     fn max_request_blocks(&self) -> usize {
