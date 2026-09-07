@@ -725,6 +725,8 @@ fn terminal_shutdown_closes_drains_and_errors_every_owner_once() {
         spec_decode: None,
         prefix_cache_queries: 0,
         prefix_cache_hits: 0,
+        prefix_cache_external_queries: 0,
+        prefix_cache_external_hits: 0,
     });
     terminal_scheduler_shutdown(
         &mut submit_rx,

@@ -2319,6 +2319,8 @@ impl Scheduler for Gemma4Scheduler {
             // so this line reports zero queries/hits until it is wired up.
             prefix_cache_queries: 0,
             prefix_cache_hits: 0,
+            prefix_cache_external_queries: 0,
+            prefix_cache_external_hits: 0,
         }
     }
 }

@@ -66,6 +66,7 @@ impl FakeExecutor {
             stop_token: None,
             prefix_hit_tokens: 0,
             prefix_cache_enabled: true,
+            prefix_external_hit_tokens: 0,
         }
     }
 
@@ -80,6 +81,13 @@ impl FakeExecutor {
     /// off): no `match_and_add_prefix` happens, so no query may be counted.
     pub(crate) fn without_prefix_cache(mut self) -> Self {
         self.prefix_cache_enabled = false;
+        self
+    }
+
+    /// Simulate hits restored from the external side (CPU offload / P2P) rather
+    /// than found in local KV.
+    pub(crate) fn with_external_prefix_hit(mut self, tokens: usize) -> Self {
+        self.prefix_external_hit_tokens = tokens;
         self
     }
 
@@ -125,11 +133,13 @@ impl FakeExecutor {
             first_token: 100 + req.request_id.raw() as u32,
             first_token_logprob: None,
             prompt_logprobs: None,
-            // A simulated prefix-cache hit is reported only on the request's
-            // first chunk (start == 0); later chunks carry no cached prefix.
-            // With the cache off nothing is matched, so no token is cached.
-            cached_tokens: if start == 0 && self.prefix_cache_enabled {
-                self.prefix_hit_tokens
+            // A simulated lookup is reported only on the request's first chunk
+            // (start == 0); later chunks carry no cached prefix. `None` models
+            // a cache that never ran a lookup (switched off, or echo).
+            cached_tokens: (start == 0 && self.prefix_cache_enabled)
+                .then_some(self.prefix_hit_tokens),
+            external_hit_tokens: if start == 0 {
+                self.prefix_external_hit_tokens
             } else {
                 0
             },
@@ -173,9 +183,8 @@ impl ModelExecutor for FakeExecutor {
         64
     }
 
-    fn prefix_cache_enabled(&self) -> bool {
-        self.prefix_cache_enabled
-    }
+    // No capability query: the fake reports `None` from `fake_prefill_result`
+    // when the cache is off, which is what the resolver consumes.
 
     fn available_blocks(&self) -> usize {
         self.available_blocks
