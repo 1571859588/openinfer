@@ -37,6 +37,7 @@ use vllm_engine_core_client::protocol::request::EngineCoreRequest;
 use vllm_engine_core_client::protocol::request::EngineCoreRequestType;
 use vllm_engine_core_client::protocol::stats::BaseCacheStats;
 use vllm_engine_core_client::protocol::stats::PrefillStats;
+use vllm_engine_core_client::protocol::stats::PrefixCacheStats;
 use vllm_engine_core_client::protocol::stats::SchedulerStats;
 use vllm_engine_core_client::protocol::stats::SpecDecodingStats;
 use vllm_engine_core_client::protocol::utility::UtilityCallId;
@@ -620,21 +621,16 @@ pub(crate) fn scheduler_stats_from(snapshot: &SchedulerMetrics) -> SchedulerStat
 /// through this type and cannot drift.
 #[derive(Default)]
 pub(crate) struct PrefixCacheTracker {
-<<<<<<< HEAD
-    last_queries: u64,
-    last_hits: u64,
-=======
     queries: u64,
     hits: u64,
     external_queries: u64,
     external_hits: u64,
->>>>>>> 9eed2740 (fixup! fix(observability): report prefix-cache counters as token-granular per-send deltas)
 }
 
 impl PrefixCacheTracker {
-    /// The delta to stamp on the next outgoing batch. Advances the baseline, so
-    /// a caller that declines to send after calling this drops only a no-op
-    /// interval.
+    /// The local delta to stamp on the next outgoing batch. Advances the
+    /// baseline, so a caller that declines to send after calling this drops
+    /// only a no-op interval.
     pub(crate) fn interval(&mut self, snapshot: &SchedulerMetrics) -> BaseCacheStats {
         let delta = BaseCacheStats {
             queries: snapshot.prefix_cache_queries.saturating_sub(self.queries),
@@ -657,6 +653,7 @@ impl PrefixCacheTracker {
         let base = BaseCacheStats {
             queries: snapshot
                 .prefix_cache_external_queries
+<<<<<<< HEAD
                 .saturating_sub(self.external_queries),
             hits: snapshot
                 .prefix_cache_external_hits
@@ -665,12 +662,25 @@ impl PrefixCacheTracker {
         };
         self.external_queries = snapshot.prefix_cache_external_queries;
         self.external_hits = snapshot.prefix_cache_external_hits;
+=======
+                .saturating_sub(self.last_external_queries),
+            hits: snapshot
+                .prefix_cache_external_hits
+                .saturating_sub(self.last_external_hits),
+            ..BaseCacheStats::default()
+        };
+        self.last_external_queries = snapshot.prefix_cache_external_queries;
+        self.last_external_hits = snapshot.prefix_cache_external_hits;
+>>>>>>> bbfcf73c (feat(observability): attribute externally restored prefix hits separately)
         (base.queries > 0 || base.hits > 0).then(|| PrefixCacheStats {
             base,
             ..PrefixCacheStats::default()
         })
     }
+<<<<<<< HEAD
 >>>>>>> 9eed2740 (fixup! fix(observability): report prefix-cache counters as token-granular per-send deltas)
+=======
+>>>>>>> bbfcf73c (feat(observability): attribute externally restored prefix hits separately)
 }
 
 /// Per-interval spec-decode delta from two cumulative snapshots, in the wire
@@ -738,6 +748,7 @@ async fn publish_scheduler_stats(
         let snapshot = *load_rx.borrow_and_update();
         let mut stats = scheduler_stats_from(&snapshot);
         stats.prefix_cache_stats.base = prefix.interval(&snapshot);
+        stats.connector_prefix_cache_stats = prefix.external_interval(&snapshot);
         stats.spec_decoding_stats = spec.interval(&snapshot);
         let outputs = RequestBatchOutputs {
             engine_index,
