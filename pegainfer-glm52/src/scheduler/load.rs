@@ -33,6 +33,15 @@ pub(super) fn publish_load(
         // mid-resolve and never counts a request twice.
         num_waiting_reqs: (pending.len() + resolving) as u64,
         spec_decode: None,
+<<<<<<< HEAD
         prefix_cache: None,
+=======
+        // MLA + MoE line without a prefix cache, so the counters stay at
+        // their neutral zero.
+        prefix_cache_queries: 0,
+        prefix_cache_hits: 0,
+        prefix_cache_external_queries: 0,
+        prefix_cache_external_hits: 0,
+>>>>>>> 6c3961a1 (feat(observability): attribute externally restored prefix hits separately)
     });
 }

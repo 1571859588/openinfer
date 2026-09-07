@@ -611,6 +611,79 @@ pub(crate) fn scheduler_stats_from(snapshot: &SchedulerMetrics) -> SchedulerStat
     }
 }
 
+<<<<<<< HEAD
+=======
+/// Prefix-cache counterpart of [`SpecDecodeTracker`]: the scheduler holds
+/// running totals while the wire must carry per-interval deltas, because the
+/// frontend increments its `prefix_cache_*_total` counters by the value of
+/// *every* `SchedulerStats` it receives. Shipping the running total would
+/// re-add the whole history on each subsequent batch, so both bridges convert
+/// through this type and cannot drift.
+#[derive(Default)]
+pub(crate) struct PrefixCacheTracker {
+    queries: u64,
+    hits: u64,
+    external_queries: u64,
+    external_hits: u64,
+}
+
+impl PrefixCacheTracker {
+    /// The local delta to stamp on the next outgoing batch. Advances the
+    /// baseline, so a caller that declines to send after calling this drops
+    /// only a no-op interval.
+    pub(crate) fn interval(&mut self, snapshot: &SchedulerMetrics) -> BaseCacheStats {
+        let delta = BaseCacheStats {
+            queries: snapshot.prefix_cache_queries.saturating_sub(self.queries),
+            hits: snapshot.prefix_cache_hits.saturating_sub(self.hits),
+            ..BaseCacheStats::default()
+        };
+        self.queries = snapshot.prefix_cache_queries;
+        self.hits = snapshot.prefix_cache_hits;
+        delta
+    }
+    /// The same conversion for the external (connector) side — blocks restored
+    /// from CPU offload or over P2P rather than found in local KV. Kept on a
+    /// separate baseline so the two families cannot pollute each other, and
+    /// `None` when nothing was restored: a line with no connector leaves
+    /// `connector_prefix_cache_stats` unset instead of reporting zeros.
+    pub(crate) fn external_interval(
+        &mut self,
+        snapshot: &SchedulerMetrics,
+    ) -> Option<PrefixCacheStats> {
+        let base = BaseCacheStats {
+            queries: snapshot
+                .prefix_cache_external_queries
+<<<<<<< HEAD
+                .saturating_sub(self.external_queries),
+            hits: snapshot
+                .prefix_cache_external_hits
+                .saturating_sub(self.external_hits),
+            ..BaseCacheStats::default()
+        };
+        self.external_queries = snapshot.prefix_cache_external_queries;
+        self.external_hits = snapshot.prefix_cache_external_hits;
+=======
+                .saturating_sub(self.last_external_queries),
+            hits: snapshot
+                .prefix_cache_external_hits
+                .saturating_sub(self.last_external_hits),
+            ..BaseCacheStats::default()
+        };
+        self.last_external_queries = snapshot.prefix_cache_external_queries;
+        self.last_external_hits = snapshot.prefix_cache_external_hits;
+>>>>>>> bbfcf73c (feat(observability): attribute externally restored prefix hits separately)
+        (base.queries > 0 || base.hits > 0).then(|| PrefixCacheStats {
+            base,
+            ..PrefixCacheStats::default()
+        })
+    }
+<<<<<<< HEAD
+>>>>>>> 9eed2740 (fixup! fix(observability): report prefix-cache counters as token-granular per-send deltas)
+=======
+>>>>>>> bbfcf73c (feat(observability): attribute externally restored prefix hits separately)
+}
+
+>>>>>>> 6c3961a1 (feat(observability): attribute externally restored prefix hits separately)
 /// Per-interval spec-decode delta from two cumulative snapshots, in the wire
 /// shape the frontend increments its `vllm:spec_decode_*_total` counters by (see
 /// [`SpecDecodeCounters`] for why the transport carries totals and the wire
@@ -740,7 +813,14 @@ async fn publish_scheduler_stats(
     let mut tracker = StatsTracker::default();
     loop {
         let snapshot = *load_rx.borrow_and_update();
+<<<<<<< HEAD
         let stats = tracker.stats(&snapshot);
+=======
+        let mut stats = scheduler_stats_from(&snapshot);
+        stats.prefix_cache_stats.base = prefix.interval(&snapshot);
+        stats.connector_prefix_cache_stats = prefix.external_interval(&snapshot);
+        stats.spec_decoding_stats = spec.interval(&snapshot);
+>>>>>>> 6c3961a1 (feat(observability): attribute externally restored prefix hits separately)
         let outputs = RequestBatchOutputs {
             engine_index,
             scheduler_stats: Some(Box::new(stats)),
