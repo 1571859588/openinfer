@@ -37,5 +37,7 @@ pub(super) fn publish_load(
         // their neutral zero.
         prefix_cache_queries: 0,
         prefix_cache_hits: 0,
+        prefix_cache_external_queries: 0,
+        prefix_cache_external_hits: 0,
     });
 }

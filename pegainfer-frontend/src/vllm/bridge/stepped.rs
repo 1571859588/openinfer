@@ -225,6 +225,7 @@ impl SteppedEngineBridge {
         let snapshot = self.scheduler.metrics();
         let mut stats = scheduler_stats_from(&snapshot);
         stats.prefix_cache_stats.base = prefix.interval(&snapshot);
+        stats.connector_prefix_cache_stats = prefix.external_interval(&snapshot);
         stats.spec_decoding_stats = spec.interval(&snapshot);
         stats
     }

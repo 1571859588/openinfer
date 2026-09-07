@@ -812,6 +812,8 @@ impl Scheduler for Qwen35Scheduler {
             // this line has no prefix cache to count.
             prefix_cache_queries: 0,
             prefix_cache_hits: 0,
+            prefix_cache_external_queries: 0,
+            prefix_cache_external_hits: 0,
         }
     }
 }
