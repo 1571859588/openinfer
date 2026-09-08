@@ -109,9 +109,8 @@ impl SteppedEngineBridge {
         else {
             return Ok(());
         };
-        // Seed the gauges before any traffic. Ship the delta since last send
-        // (zero here, the first interval) so the frontend's *_total counters
-        // accumulate deltas, never the running total.
+        // Seed the gauges before any traffic; `PrefixCacheTracker` owns the
+        // totals-to-deltas conversion they must go through.
         send_outputs(
             &output_tx,
             RequestBatchOutputs {
@@ -768,6 +767,7 @@ mod tests {
         let bridge = bridge(handle);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut spec = SpecDecodeTracker::default();
+        let mut prefix = PrefixCacheTracker::default();
         for (running, updates) in [(1, vec![scheduled]), (0, Vec::new())] {
             backend.metrics.publish(&crate::engine::SchedulerMetrics {
                 num_running_reqs: running,
@@ -779,6 +779,7 @@ mod tests {
                     &UnixAnchor::now(),
                     &mut streams,
                     &mut HashMap::new(),
+                    &mut prefix,
                     &mut spec,
                     &tx,
                 )
