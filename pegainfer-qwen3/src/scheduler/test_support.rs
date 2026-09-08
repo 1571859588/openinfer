@@ -49,6 +49,9 @@ pub(crate) struct FakeExecutor {
     // `false` models a real executor with prefix caching switched off, which
     // never calls `match_and_add_prefix` and must therefore report no queries.
     prefix_cache_enabled: bool,
+    // Tokens of the simulated hit attributed to the external side (CPU offload
+    // / P2P) rather than found in local KV.
+    prefix_external_hit_tokens: usize,
 }
 
 impl FakeExecutor {
