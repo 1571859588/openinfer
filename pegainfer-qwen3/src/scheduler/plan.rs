@@ -279,8 +279,9 @@ mod tests {
             prefetch_offered: false,
             prefill_pos: 0,
             step_chunk: 3,
-            cached_tokens: None,
-            external_hit_tokens: 0,
+            // `usize`, not the executor's `Option`: this carries the hits
+            // reported by the first chunk across later ones.
+            cached_tokens: 0,
         }
     }
 
