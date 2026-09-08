@@ -99,9 +99,8 @@ impl SteppedEngineBridge {
             &shutdown,
         )
         .await?;
-        // Seed the gauges before any traffic. Ship the delta since last send
-        // (zero here, the first interval) so the frontend's *_total counters
-        // accumulate deltas, never the running total.
+        // Seed the gauges before any traffic; `PrefixCacheTracker` owns the
+        // totals-to-deltas conversion they must go through.
         send_outputs(
             &output_tx,
             RequestBatchOutputs {
@@ -265,9 +264,6 @@ impl SteppedEngineBridge {
         // load before committing the step), so the batch carries stats that
         // match its own tokens — a finishing batch reports the drained state
         // and the gauges settle instead of freezing at the last busy value.
-        // Ship only the delta since the last send so the frontend's
-        // `prefix_cache_*_total` counters accumulate increments, not the whole
-        // running total on every batch.
         send_outputs(
             output_tx,
             RequestBatchOutputs {

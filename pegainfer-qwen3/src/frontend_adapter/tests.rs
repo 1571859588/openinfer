@@ -382,10 +382,8 @@ fn lora_control_waits_until_scheduler_idle() {
 ///    (queried prompt tokens / cached tokens), matching vLLM's
 ///    `PrefixCacheStats`, so `hit_rate = hits/queries` stays in [0, 1];
 ///  * cumulative-counter double counting — every request is counted exactly
-///    once (on its first prefill chunk), and the bridge exports per-send
-///    deltas of the running total (see `prefix_cache_delta`), so repeated
-///    scrapes at the same instant are identical and the frontend does not
-///    re-add history on every token batch.
+///    once, on its first prefill chunk; the totals-to-deltas conversion the
+///    bridge applies (and why) lives on `PrefixCacheTracker`.
 #[test]
 fn prefix_cache_metrics_stable_across_batches_and_scrapes() {
     const BATCHES: u64 = 4;
@@ -419,10 +417,6 @@ fn prefix_cache_metrics_stable_across_batches_and_scrapes() {
             "batch {batch} prefix queries never reached {target}"
         );
         let m = partition.handle.metrics();
-        eprintln!(
-            "[scrape] after batch {batch}: prefix_cache_queries={} prefix_cache_hits={}",
-            m.prefix_cache_queries, m.prefix_cache_hits
-        );
         scrapes.push((batch, m.prefix_cache_queries, m.prefix_cache_hits));
     }
 
@@ -431,18 +425,12 @@ fn prefix_cache_metrics_stable_across_batches_and_scrapes() {
         let _ = steps.collect_terminal(c.id());
     }
 
-    // Final stable snapshot: repeated scrapes at the same instant are identical.
+    // Monotonic totals, not re-derived per scrape: two reads at the same
+    // instant agree.
     let a = partition.handle.metrics();
     let b = partition.handle.metrics();
-    let c = partition.handle.metrics();
     assert_eq!(a.prefix_cache_queries, b.prefix_cache_queries);
     assert_eq!(a.prefix_cache_hits, b.prefix_cache_hits);
-    assert_eq!(b.prefix_cache_queries, c.prefix_cache_queries);
-    assert_eq!(b.prefix_cache_hits, c.prefix_cache_hits);
-    eprintln!(
-        "[scrape] final (x3 identical): prefix_cache_queries={} prefix_cache_hits={}",
-        a.prefix_cache_queries, a.prefix_cache_hits
-    );
 
     // Token-granular correctness per vLLM PrefixCacheStats: every request
     // queries PROMPT_TOKENS and hits HIT_TOKENS, so the running totals are
@@ -456,10 +444,6 @@ fn prefix_cache_metrics_stable_across_batches_and_scrapes() {
         "hits (cached tokens) must not exceed queries (queried tokens)"
     );
     let hit_rate = a.prefix_cache_hits as f64 / a.prefix_cache_queries as f64;
-    eprintln!(
-        "[rate] prefix hit_rate={:.3} (== {}/{})",
-        hit_rate, HIT_TOKENS, PROMPT_TOKENS
-    );
     assert!((hit_rate - HIT_TOKENS as f64 / PROMPT_TOKENS as f64).abs() < 1e-9);
 
     // Each batch contributed a stable, non-zero delta of exactly
@@ -469,10 +453,6 @@ fn prefix_cache_metrics_stable_across_batches_and_scrapes() {
     for (batch, q, h) in scrapes {
         let dq = q - prev_q;
         let dh = h - prev_h;
-        eprintln!(
-            "[delta] batch {batch}: +queries={dq} +hits={dh} (hit_rate={:.3})",
-            h as f64 / q.max(1) as f64
-        );
         assert_eq!(
             dq,
             PER_BATCH * PROMPT_TOKENS,

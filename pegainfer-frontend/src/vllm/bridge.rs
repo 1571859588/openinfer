@@ -592,13 +592,9 @@ fn stop_sentinel_id(eos_token_id: Option<u32>, stop_token_ids: &[u32]) -> Option
 /// Prometheus gauges (`scheduler_running`, `scheduler_waiting`,
 /// `kv_cache_usage`) and DP load balancer consume.
 ///
-/// `prefix_cache_stats` is left at zero here on purpose: the running totals in
-/// `SchedulerMetrics` must NOT be shipped as-is, because the frontend's
-/// Prometheus logger increments its `prefix_cache_*_total` counters by the
-/// value of *every* `SchedulerStats` it receives. The bridge therefore exports
-/// per-send **deltas** (see [`PrefixCacheTracker`]) so a cached request does
-/// not re-add the whole history on each subsequent token batch. Callers fill
-/// `prefix_cache_stats` from [`PrefixCacheTracker::interval`] after this call.
+/// `prefix_cache_stats` is left at zero here: callers fill it from
+/// [`PrefixCacheTracker::interval`], which owns the totals-to-deltas
+/// conversion and the reason for it.
 pub(crate) fn scheduler_stats_from(snapshot: &SchedulerMetrics) -> SchedulerStats {
     SchedulerStats {
         num_running_reqs: snapshot.num_running_reqs,

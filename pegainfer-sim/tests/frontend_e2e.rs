@@ -26,6 +26,12 @@ const SPEC_METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-spec-metrics";
 const SPEC_K: usize = 3;
 const SPEC_ACCEPTED: usize = 2;
 const PREFIX_METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-prefix-metrics";
+const ABORT_METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-abort-metrics";
+/// Long enough that a request is admitted (counting its lookup) well before it
+/// can emit a token, so abandoning it leaves a delta with no output to ride.
+const ABORT_TTFT_MS: f64 = 400.0;
+/// Short enough that the client gives up inside that prefill window.
+const ABORT_CLIENT_TIMEOUT: Duration = Duration::from_millis(60);
 /// The pretend lookup the prefix-metrics server reports on every admitted
 /// non-echo request: 8 prompt tokens queried, 5 found in local KV and 2 of the
 /// remainder restored from the connector.
@@ -79,6 +85,19 @@ impl SimServer {
             1,
             PREFIX_METRICS_MODEL_NAME,
             SimulatedEngineConfig::new(0.0, 1000.0, 0.0, 1)?
+                .with_prefix_cache(PREFIX_LOCAL_HITS, PREFIX_EXTERNAL_HITS),
+        )
+        .await
+    }
+
+    /// A scripted lookup plus a slow prefill: the request counts its lookup on
+    /// admission and is then abandoned without ever emitting a token.
+    async fn spawn_aborting_prefix_cache() -> Result<Self> {
+        Self::spawn_with_config(
+            model_dir_with_minimal_metadata()?,
+            1,
+            ABORT_METRICS_MODEL_NAME,
+            SimulatedEngineConfig::new(ABORT_TTFT_MS, 1000.0, 0.0, 1)?
                 .with_prefix_cache(PREFIX_LOCAL_HITS, PREFIX_EXTERNAL_HITS),
         )
         .await
@@ -409,6 +428,60 @@ async fn stepped_bridge_reports_prefix_cache_counters_to_prometheus() -> Result<
                 PREFIX_EXTERNAL_HITS as f64,
             ),
         ],
+        &server.model_name,
+    )
+    .await?;
+
+    server.shutdown().await
+}
+
+/// A request that is admitted and then aborted produces no tokens to carry its
+/// prefix delta: only the cached-token metadata record, then nothing. The
+/// stepped bridge still has to ship that delta in a stats-only batch, or the
+/// lookup is lost for good (and a later batch must not re-send it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aborted_request_still_ships_its_prefix_lookup() -> Result<()> {
+    let server = SimServer::spawn_aborting_prefix_cache().await?;
+    let client = test_client()?;
+    let abandoning = test_client_with_timeout(ABORT_CLIENT_TIMEOUT)?;
+
+    let body = json!({
+        "model": server.model_name,
+        "prompt": vec![1u32; PREFIX_PROMPT],
+        "max_tokens": 4,
+        "temperature": 0.0,
+        "ignore_eos": true,
+    })
+    .to_string();
+
+    // Abandoned mid-prefill: admitted (so its lookup was counted), never served.
+    let _ = abandoning
+        .post(format!("{}/v1/completions", server.base_url))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body.clone())
+        .send()
+        .await;
+
+    // A second request drives the next step — the moment a stranded delta would
+    // be flushed, and the moment a re-sent one would double the total.
+    client
+        .post(format!("{}/v1/completions", server.base_url))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await?
+        .error_for_status()?;
+
+    // Both lookups are present exactly once: 2 x PREFIX_PROMPT, not just the
+    // survivor's, and not a delta replayed on top of it.
+    wait_for_metrics(
+        &client,
+        &server.base_url,
+        &[(
+            "vllm:prefix_cache_queries_total",
+            "0",
+            2.0 * PREFIX_PROMPT as f64,
+        )],
         &server.model_name,
     )
     .await?;
@@ -985,8 +1058,14 @@ async fn post_completion_stream(
 }
 
 fn test_client() -> Result<Client> {
+    test_client_with_timeout(HTTP_TIMEOUT)
+}
+
+/// A client that gives up mid-prefill, which is how a test abandons a request
+/// without the server's cooperation.
+fn test_client_with_timeout(timeout: Duration) -> Result<Client> {
     Client::builder()
-        .timeout(HTTP_TIMEOUT)
+        .timeout(timeout)
         .build()
         .context("failed to build HTTP test client")
 }
