@@ -593,13 +593,9 @@ fn stop_sentinel_id(eos_token_id: Option<u32>, stop_token_ids: &[u32]) -> Option
 /// Prometheus gauges (`scheduler_running`, `scheduler_waiting`,
 /// `kv_cache_usage`) and DP load balancer consume.
 ///
-/// `prefix_cache_stats` is left at zero here on purpose: the running totals in
-/// `SchedulerMetrics` must NOT be shipped as-is, because the frontend's
-/// Prometheus logger increments its `prefix_cache_*_total` counters by the
-/// value of *every* `SchedulerStats` it receives. The bridge therefore exports
-/// per-send **deltas** (see [`PrefixCacheTracker`]) so a cached request does
-/// not re-add the whole history on each subsequent token batch. Callers fill
-/// `prefix_cache_stats` from [`PrefixCacheTracker::interval`] after this call.
+/// `prefix_cache_stats` is left at zero here: callers fill it from
+/// [`PrefixCacheTracker::interval`], which owns the totals-to-deltas
+/// conversion and the reason for it.
 pub(crate) fn scheduler_stats_from(snapshot: &SchedulerMetrics) -> SchedulerStats {
     SchedulerStats {
         num_running_reqs: snapshot.num_running_reqs,
@@ -653,7 +649,6 @@ impl PrefixCacheTracker {
         let base = BaseCacheStats {
             queries: snapshot
                 .prefix_cache_external_queries
-<<<<<<< HEAD
                 .saturating_sub(self.external_queries),
             hits: snapshot
                 .prefix_cache_external_hits
@@ -662,25 +657,11 @@ impl PrefixCacheTracker {
         };
         self.external_queries = snapshot.prefix_cache_external_queries;
         self.external_hits = snapshot.prefix_cache_external_hits;
-=======
-                .saturating_sub(self.last_external_queries),
-            hits: snapshot
-                .prefix_cache_external_hits
-                .saturating_sub(self.last_external_hits),
-            ..BaseCacheStats::default()
-        };
-        self.last_external_queries = snapshot.prefix_cache_external_queries;
-        self.last_external_hits = snapshot.prefix_cache_external_hits;
->>>>>>> bbfcf73c (feat(observability): attribute externally restored prefix hits separately)
         (base.queries > 0 || base.hits > 0).then(|| PrefixCacheStats {
             base,
             ..PrefixCacheStats::default()
         })
     }
-<<<<<<< HEAD
->>>>>>> 9eed2740 (fixup! fix(observability): report prefix-cache counters as token-granular per-send deltas)
-=======
->>>>>>> bbfcf73c (feat(observability): attribute externally restored prefix hits separately)
 }
 
 /// Per-interval spec-decode delta from two cumulative snapshots, in the wire
