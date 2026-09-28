@@ -20,6 +20,7 @@ use pegainfer_frontend::engine::Engine;
 use pegainfer_frontend::engine::EngineInfo;
 use pegainfer_frontend::engine::EngineLoadOptions;
 use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::PromptEcho;
 use pegainfer_frontend::engine::QueuedRequest;
 use pegainfer_frontend::engine::RejectReason;
 use pegainfer_frontend::engine::Request;
@@ -527,9 +528,13 @@ impl Drop for AsyncPrefillLane {
 
 /// The fail-closed request validation every admission path shares; `Err`
 /// carries the typed refusal. Refuse every unsupported capability carried by
-/// the stepped `Request` (echo, LoRA and P/D transfer metadata) rather than
-/// silently ignoring it.
-fn validate_request(request: &Request, max_context: usize) -> Result<usize, RejectReason> {
+/// the stepped `Request` (LoRA and P/D transfer metadata) rather than
+/// silently ignoring it, and a scored prompt longer than `score_ceiling`.
+fn validate_request(
+    request: &Request,
+    max_context: usize,
+    score_ceiling: usize,
+) -> Result<usize, RejectReason> {
     let prompt_tokens = request.prompt_tokens.len();
     if prompt_tokens == 0 {
         return Err(RejectReason::Unsupported {
@@ -556,9 +561,10 @@ fn validate_request(request: &Request, max_context: usize) -> Result<usize, Reje
             feature: "LoRA".into(),
         });
     }
-    if request.prompt_logprobs.is_some() {
-        return Err(RejectReason::Unsupported {
-            feature: "prompt_logprobs".into(),
+    if request.prompt_logprobs.is_some() && prompt_tokens > score_ceiling {
+        return Err(RejectReason::EchoPrefillTokens {
+            prompt_tokens,
+            limit: score_ceiling,
         });
     }
     if request.kv_transfer_params.is_some() {
@@ -1068,6 +1074,10 @@ struct EngineState {
     /// The serving ceiling this process was started with; the pools are
     /// budgeted against it.
     max_context: usize,
+    /// The longest prompt a scored request may carry. It prefills whole, so
+    /// it is held to the default ceiling and to the local pages an idle
+    /// server has.
+    score_ceiling: usize,
     /// The decode-slot count the pools are budgeted for; requests past it
     /// queue.
     slots: usize,
@@ -1198,10 +1208,13 @@ impl EngineState {
         }
     }
 
+    /// A prompt that asks for its scores never resumes: every position has
+    /// to go through this prefill's head.
     fn resolve_newcomer_kv(&mut self, request: &Request) -> (GemmaKv, Option<u64>) {
         match self
             .prefix_cache
             .as_mut()
+            .filter(|_| request.prompt_logprobs.is_none())
             .and_then(|cache| cache.resolve(&request.prompt_tokens))
         {
             Some((entry, t)) => match self.serve.restore_from_checkpoint(&self.ctx, entry, t) {
@@ -1225,13 +1238,14 @@ impl EngineState {
             ledger.retire(request.id);
             return PreparedNewcomer::Done;
         }
-        let context_len = match validate_request(&request.request, self.max_context) {
-            Ok(len) => len,
-            Err(reason) => {
-                ledger.reject(request.id, reason);
-                return PreparedNewcomer::Done;
-            }
-        };
+        let context_len =
+            match validate_request(&request.request, self.max_context, self.score_ceiling) {
+                Ok(len) => len,
+                Err(reason) => {
+                    ledger.reject(request.id, reason);
+                    return PreparedNewcomer::Done;
+                }
+            };
         let (mut kv, resumed) = self.resolve_newcomer_kv(&request.request);
         let new_tokens = request.request.prompt_tokens.len() - kv.local.seq_len();
         if options
@@ -1318,7 +1332,8 @@ impl EngineState {
         let sliding_window = weights.config.sliding_window;
         // With the chunk knob set every scan is bounded by window plus
         // segment — except the lane's, which prefills whole and keeps the
-        // full transient.
+        // full transient, and a scored prompt's, which prefills whole and
+        // is refused past what the pool holds.
         let transient_pages = match mix_chunk {
             Some(chunk) if lane_mode.is_none() => {
                 // A round's rows split across walkers, and every walker's
@@ -1342,6 +1357,8 @@ impl EngineState {
                  {slots} slots and {cache_entries} cache entries"
             )
         })?;
+        // Every local page but the padding one, an idle server's whole pool.
+        let score_ceiling = MAX_CONTEXT.min((local_pages - 1) * LOCAL_PAGE_SIZE);
         // The arena pads steps to power-of-two buckets.
         let arena_rows = slots.next_power_of_two();
         // Page ids and mixed-step row metadata are i32 downstream, and the
@@ -1437,6 +1454,7 @@ impl EngineState {
             mix_gather,
             mix_max_prompts,
             max_context,
+            score_ceiling,
             slots,
             admit_coalesce,
         })
@@ -1518,9 +1536,13 @@ impl EngineState {
         // pages right before it is written, so no walker parks a quantum
         // — parked first segments across several walkers would exhaust
         // the one shared segment transient the pool provisions.
-        let lane_takes = self.lane.is_some() && !active.is_empty();
+        // A prompt that asks for its scores takes the solo whole-prompt
+        // prefill even beside a live batch: only that pass holds every
+        // prompt row's final hidden state at once.
+        let scored = item.request.prompt_logprobs.is_some();
+        let lane_takes = self.lane.is_some() && !active.is_empty() && !scored;
         let options = NewcomerOptions {
-            reserve_whole: self.mix_chunk.is_none() || lane_takes,
+            reserve_whole: self.mix_chunk.is_none() || lane_takes || scored,
             evict_cache: true,
             can_wait,
             max_new_tokens: None,
@@ -1537,7 +1559,7 @@ impl EngineState {
         // runs. A prompt arriving with nothing active stays on the sync
         // path: there is nothing to protect, and full-SM speed wins the head
         // of every refill burst.
-        if self.lane.is_some() && !active.is_empty() {
+        if lane_takes {
             return self.launch_async_prefill(request, kv, resumed, ledger);
         }
 
@@ -1546,6 +1568,8 @@ impl EngineState {
         // advances every active row.
         if !active.is_empty() {
             self.drain_pipeline(active, ledger)?;
+        }
+        if !active.is_empty() && !scored {
             self.ready_decode_rows(active, ledger);
             if !active.is_empty() {
                 // Gather more admissible prompts into the same step. A
@@ -1570,6 +1594,10 @@ impl EngineState {
                     let Some(candidate) = pending.pop_front() else {
                         break;
                     };
+                    if candidate.request.prompt_logprobs.is_some() {
+                        pending.push_front(candidate);
+                        break;
+                    }
                     *attempts += 1;
                     let options = NewcomerOptions {
                         reserve_whole: self.mix_chunk.is_none(),
@@ -1598,9 +1626,39 @@ impl EngineState {
             }
         }
 
-        // Under the chunk knob a solo prompt walks its own segments too:
-        // residency stays window plus segment whatever the prompt length.
-        let stepped = if let Some(chunk) = self.mix_chunk {
+        let mut echo = None;
+        let stepped = if let Some(top_k) = request.request.prompt_logprobs {
+            let prompt = &request.request.prompt_tokens;
+            let mut scores: Vec<Option<TokenLogprob>> = vec![None];
+            let (ctx, suppress_ids) = (&self.ctx, &self.suppress_ids);
+            let mut score = |logits: &mut HiddenStates, start: usize| -> Result<()> {
+                // The same logits a sampled token is scored on: softcapped,
+                // then suppressed.
+                ops::suppress_logits_bf16_in_place(ctx, logits, suppress_ids)
+                    .context("suppression")?;
+                let requests: Vec<LogprobRequest> = (0..logits.seq_len)
+                    .map(|row| LogprobRequest {
+                        row,
+                        picked: prompt[start + row + 1],
+                        top_k,
+                    })
+                    .collect();
+                let scored = pegainfer_sample::token_logprobs_batch(ctx, logits, &requests)
+                    .context("prompt logprobs")?;
+                scores.extend(scored.into_iter().map(Some));
+                Ok(())
+            };
+            let stepped = self
+                .serve
+                .step_scoring(ctx, &mut kv, prompt, Some(&mut score));
+            echo = Some(PromptEcho {
+                ids: prompt.clone(),
+                logprobs: scores,
+            });
+            stepped
+        } else if let Some(chunk) = self.mix_chunk {
+            // Under the chunk knob a solo prompt walks its own segments too:
+            // residency stays window plus segment whatever the prompt length.
             self.walk_plain_prompt(&mut kv, &request.request.prompt_tokens, chunk)
         } else {
             let resume = kv.local.seq_len();
@@ -1625,7 +1683,7 @@ impl EngineState {
             &request.request.prompt_tokens,
             resumed,
         );
-        Ok(self.first_token_flow(request, kv, &mut logits, ledger))
+        Ok(self.first_token_flow(request, kv, &mut logits, echo, ledger))
     }
 
     /// Sample and settle a prefill's first token from logits row 0 — the
@@ -1635,6 +1693,7 @@ impl EngineState {
         request: QueuedRequest,
         kv: GemmaKv,
         logits: &mut HiddenStates,
+        echo: Option<PromptEcho>,
         ledger: &mut RequestLedger,
     ) -> Admitted {
         let sampled = {
@@ -1669,6 +1728,7 @@ impl EngineState {
             kv,
             sampled.picked[0],
             sampled.logprobs[0].take(),
+            echo,
             ledger,
         ) {
             Some(entry) => Admitted::Active(Box::new(entry)),
@@ -1786,7 +1846,7 @@ impl EngineState {
             resumed,
         );
         if let Admitted::Active(entry) =
-            self.first_token_flow(request, kv, &mut pass.logits, ledger)
+            self.first_token_flow(request, kv, &mut pass.logits, None, ledger)
         {
             active.push(*entry);
         }
@@ -2037,7 +2097,9 @@ impl EngineState {
             &request.request.prompt_tokens,
             resumed,
         );
-        if let Some(entry) = settle_first_token(&self.policy, request, kv, next, logprob, ledger) {
+        if let Some(entry) =
+            settle_first_token(&self.policy, request, kv, next, logprob, None, ledger)
+        {
             active.push(entry);
         }
     }
@@ -2308,6 +2370,7 @@ impl EngineState {
                 kv,
                 sampled.picked[j],
                 sampled.logprobs[j].take(),
+                None,
                 ledger,
             ) {
                 active.push(entry);
@@ -2569,12 +2632,16 @@ fn settle_first_token(
     kv: GemmaKv,
     next: u32,
     logprob: Option<TokenLogprob>,
+    echo: Option<PromptEcho>,
     ledger: &mut RequestLedger,
 ) -> Option<Active> {
     let id = request.id;
     if ledger.is_aborted(id) {
         ledger.retire(id);
         return None;
+    }
+    if let Some(echo) = echo {
+        ledger.echo_prompt(id, echo);
     }
     if policy.stops(next, request.request.params.ignore_eos) {
         ledger.finish(id, FinishReason::Stop);
@@ -2893,3 +2960,7 @@ mod lane_gates_roster;
 #[cfg(test)]
 #[path = "engine/lane_gates_walk.rs"]
 mod lane_gates_walk;
+
+#[cfg(test)]
+#[path = "engine/lane_gates_logprobs.rs"]
+mod lane_gates_logprobs;
