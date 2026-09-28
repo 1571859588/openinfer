@@ -1619,6 +1619,32 @@ const GEMMA4_TILELANG_LAUNCHERS: &[(&str, &str)] = &[
     ),
 ];
 
+const GEMMA4_W4A16_TILELANG: TileLangFamily = TileLangFamily {
+    label: "GEMMA4_W4A16",
+    generator: "pegainfer-gemma4/kernels/w4a16_generate.py",
+    sources: &[
+        "pegainfer-gemma4/kernels/w4a16_defs.py",
+        "pegainfer-gemma4/kernels/generate.py",
+    ],
+    launchers: GEMMA4_W4A16_TILELANG_LAUNCHERS,
+    // Plain cp.async and mma.sync: Ampere and newer.
+    min_sm: 80,
+    // GEOMETRY is `ctas,block_n,block_k,warps`; the crate refuses a device
+    // whose SM count is not ctas / 2.
+    required_manifest: &["ARCH", "GEOMETRY", "SMEM"],
+};
+
+/// The decode GEMM over (x, packed weight, packed scales, output, stream-K
+/// partials, flags, fix-up table) dispatched on (n, k, rows), and the
+/// residency query the crate checks those kernels against.
+const GEMMA4_W4A16_TILELANG_LAUNCHERS: &[(&str, &str)] = &[
+    (
+        "gemma4_w4a16_gemm",
+        "void*, int*, int*, void*, float*, int*, int*, int*, int, int, int",
+    ),
+    ("gemma4_w4a16_occupancy", "int, int, int, int*"),
+];
+
 const K3_TILELANG: TileLangFamily = TileLangFamily {
     label: "K3",
     generator: "pegainfer-k3/kernels/generate.py",
@@ -1771,7 +1797,9 @@ fn tilelang_gencode(arch: &str, nvcc: &str) -> Option<Vec<String>> {
 }
 
 /// Parse the `KEY=VALUE` contract the generator prints on stdout and mirrors
-/// into `manifest.txt`: one `CU_PATH` per emitted translation unit, the two
+/// into `manifest.txt` (a generator that cannot lower for this build prints
+/// one `UNAVAILABLE=<reason>` line instead, and the family takes the stub
+/// tier): one `CU_PATH` per emitted translation unit, the two
 /// header roots the generated CUDA includes, and the arch the bodies were
 /// lowered for. Paths resolve against `base`, the directory the manifest
 /// describes, so a vendored directory answers for its own files wherever it
@@ -1978,8 +2006,18 @@ fn generate_tilelang_artifacts(
         String::from_utf8_lossy(&output.stderr).trim(),
     );
 
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if let Some(reason) = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("UNAVAILABLE="))
+    {
+        println!(
+            "cargo:warning={label} TileLang generation unavailable: {reason}; its launchers are NOT_SUPPORTED stubs"
+        );
+        return None;
+    }
     let mut artifacts = parse_tilelang_manifest(
-        &String::from_utf8_lossy(&output.stdout),
+        &stdout,
         &format!("the {label} TileLang generator"),
         &artifact_dir,
     );
@@ -2663,6 +2701,15 @@ fn main() {
     if cfg!(feature = "gemma4") {
         nvcc_tasks.extend(tilelang_nvcc_tasks(
             &GEMMA4_TILELANG,
+            &out_dir,
+            &cuda_include,
+            &arch_args,
+            &sm_targets,
+            &nvcc,
+        ));
+        println!("cargo:rerun-if-env-changed=PEGAINFER_GEMMA4_W4A16_SMS");
+        nvcc_tasks.extend(tilelang_nvcc_tasks(
+            &GEMMA4_W4A16_TILELANG,
             &out_dir,
             &cuda_include,
             &arch_args,
