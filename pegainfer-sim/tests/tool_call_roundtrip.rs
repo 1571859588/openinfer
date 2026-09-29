@@ -24,6 +24,7 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
+use pegainfer_frontend::vllm::ParserSelection;
 use pegainfer_sim::SimulatedEngineConfig;
 use pegainfer_sim::start_engine;
 use reqwest::Client;
@@ -228,6 +229,7 @@ impl ToolCallSimServer {
                 std::future::ready(Ok(engine.into())),
                 &model_path,
                 vec![MODEL_NAME.to_string()],
+                ParserSelection::Auto,
                 port,
                 Some(128),
                 server_shutdown,
