@@ -10,6 +10,7 @@
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::Context;
@@ -66,6 +67,8 @@ use crate::vllm::wire::requested_prompt_logprobs;
 use crate::vllm::wire::to_wire_position_logprobs;
 use crate::vllm::wire::to_wire_prompt_logprobs;
 
+const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
 pub(crate) struct SteppedEngineBridge {
     pub(crate) input_address: String,
     pub(crate) output_address: String,
@@ -78,6 +81,7 @@ pub(crate) struct SteppedEngineBridge {
 
 impl SteppedEngineBridge {
     pub(crate) async fn run(mut self, shutdown: CancellationToken) -> Result<()> {
+        let engine_dead = CancellationToken::new();
         let mut steps = self
             .scheduler
             .take_steps()
@@ -98,6 +102,7 @@ impl SteppedEngineBridge {
             self.max_model_len,
             self.kv_capacity,
             None,
+            Some(engine_dead.clone()),
             &shutdown,
         )
         .await?;
@@ -154,6 +159,13 @@ impl SteppedEngineBridge {
                         break Err(error).context("failed to dispatch local engine step");
                     }
                 }
+                () = self.scheduler.exited() => {
+                    // Dispatch what the driver committed before it exited first.
+                    if !steps.is_empty() {
+                        continue;
+                    }
+                    break Err(anyhow::anyhow!("scheduler exited"));
+                }
                 recv = input.recv() => {
                     let message = match recv.context("failed to receive local engine request") {
                         Ok(message) => message,
@@ -177,7 +189,23 @@ impl SteppedEngineBridge {
         for state in streams.values() {
             state.control.abort();
         }
+        if run_result.is_err() {
+            engine_dead.cancel();
+        }
         drop(output_tx);
+        // Deliver what is already queued, and after a failure the dead engine
+        // notice, before stopping the link.
+        if tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, async {
+            while child_tasks.join_next().await.is_some() {}
+        })
+        .await
+        .is_err()
+        {
+            warn!(
+                "local engine {} output did not drain in time",
+                self.engine_index
+            );
+        }
         child_tasks.abort_all();
         while child_tasks.join_next().await.is_some() {}
 
