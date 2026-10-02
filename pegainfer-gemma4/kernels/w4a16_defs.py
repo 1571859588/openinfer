@@ -10,8 +10,8 @@ locals [0, 2, 4, 6, 1, 3, 5, 7]. Four consecutive k16 tiles are one 16-byte
 run per lane. Each lane's two row scales travel as one bf16x2 word.
 
 Both kernels are stream-K over (64-column tile, 256-deep K stage) units on P
-persistent CTAs whose four warps split each stage's K, so x is read from
-shared memory once per CTA. A tile split across CTAs is finished in-kernel by
+persistent CTAs whose warps split each stage's K, so x is read from shared
+memory once per CTA. A tile split across CTAs is finished in-kernel by
 the CTA holding its first units: the later parts are the other CTAs' first
 tiles, written early, and are added in k order once their flags are set. The
 split depends on the shape and P alone, so a row's bits do not depend on how
@@ -38,9 +38,23 @@ from tilelang.cuda.intrinsics.macro.mma_macro_generator import TensorCoreIntrinE
 GROUP = 32
 BLOCK_N = 64
 BLOCK_K = 256
-WARPS = 4
-STAGES = 3
 BUCKETS = (1, 2, 4, 8, 16)
+
+# The stream-K fix-up keeps two CTAs resident per SM, so each CTA's dynamic
+# shared memory has to fit half the device's shared memory per SM
+# (`w4a16_generate.pick_tiling`). Only two tilings are worth offering: (4, 3),
+# the widest that fits an A100 or Hopper budget, and (2, 2), which also fits
+# Ampere's and Ada's 100 KB. (4, 2) would need 112640 B and (2, 3) 131072 B,
+# and no supported device's budget falls between the boundaries those imply.
+TILINGS = ((4, 3), (2, 2))
+# Shared memory per SM by compute capability, in bytes: A100 164 KB, Ampere
+# and Ada 100 KB, Hopper 228 KB. An arch that is not listed takes the smallest
+# of these, so a build always emits a tiling its device can hold.
+SMEM_PER_SM = {80: 163840, 86: 102400, 89: 102400, 90: 233472}
+# The driver reserves this much shared memory per block, on top of the dynamic
+# size the kernel asks for.
+SMEM_PER_BLOCK_RESERVED = 1024
+
 
 # One prelude for every kernel in the unit, so their preambles agree.
 PRELUDE = r"""
@@ -112,16 +126,19 @@ def plan(nb, kb, P):
     return offsets, flat
 
 
-def gemm(N, K, rows, P, gelu_mul=False):
+def gemm(N, K, rows, P, gelu_mul=False, tiling=TILINGS[0]):
     """The prim_func for one (shape, bucket); `plan(N // BLOCK_N, K // BLOCK_K, P)`
     gives its `fin_off` / `fin_list` arguments. With `gelu_mul` the weight is
-    an interleaved gate|up stack and `y` is `N // 2` wide."""
+    an interleaved gate|up stack and `y` is `N // 2` wide. `tiling` is one of
+    `TILINGS`."""
+    warps, stages = tiling
     assert rows in BUCKETS and N % BLOCK_N == 0 and K % BLOCK_K == 0
     swapped = rows <= 8
     xr = 8 if swapped else 16
     cols = BLOCK_N // 16
     slices = BLOCK_K // 64
-    per_warp = slices // WARPS
+    assert slices % warps == 0, f"{warps} warps cannot split {slices} K slices evenly"
+    per_warp = slices // warps
     nb, kb = N // BLOCK_N, K // BLOCK_K
     U = nb * kb
     steps = -(-U // P)
@@ -168,11 +185,11 @@ def gemm(N, K, rows, P, gelu_mul=False):
         fin_off: T.Tensor((P + 1,), "int32"),
         fin_list: T.Tensor((n_flat,), "int32"),
     ):
-        with T.Kernel(P, threads=32 * WARPS, prelude=PRELUDE) as c:
+        with T.Kernel(P, threads=32 * warps, prelude=PRELUDE) as c:
             x_sh = T.alloc_shared((xr, BLOCK_K), "bfloat16")
             w_sh = T.alloc_shared((cols, slices, 32, 4), "int32")
             s_sh = T.alloc_shared((cols, BLOCK_K // GROUP, 8), "int32")
-            c_sh = T.alloc_shared((WARPS, xr, BLOCK_N), "float")
+            c_sh = T.alloc_shared((warps, xr, BLOCK_N), "float")
             tot = T.alloc_shared((xr, BLOCK_N), "float")
             if not swapped:
                 T.annotate_layout({x_sh: make_mma_swizzle_layout(x_sh)})
@@ -189,7 +206,7 @@ def gemm(N, K, rows, P, gelu_mul=False):
             lo_u = c * U // P
             hi_u = (c + 1) * U // P
             T.clear(acc)
-            for it in T.Pipelined(steps, num_stages=STAGES):
+            for it in T.Pipelined(steps, num_stages=stages):
                 u = T.min(lo_u + it, hi_u - 1)
                 t = u // kb
                 kt = u % kb
@@ -276,7 +293,7 @@ def gemm(N, K, rows, P, gelu_mul=False):
                         for i, j in T.Parallel(rows, BLOCK_N):
                             total = T.alloc_var("float")
                             total = c_sh[0, i, j]
-                            for w in T.serial(1, WARPS):
+                            for w in T.serial(1, warps):
                                 total = total + c_sh[w, i, j]
                             tot[i, j] = total
                         T.sync_threads()
