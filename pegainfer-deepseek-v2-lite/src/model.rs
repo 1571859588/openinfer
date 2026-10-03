@@ -377,6 +377,19 @@ fn routed_expert_from_slice<'a>(
     Ok(expert)
 }
 
+pub(crate) fn routed_expert_projections<'a>(
+    layout: &ExpertParallelLayout,
+    mut expert: impl FnMut(usize) -> Result<&'a ExpertMlp>,
+) -> Result<Vec<(&'a DeviceMatrix, &'a DeviceMatrix)>> {
+    layout
+        .owned_experts()
+        .map(|global_expert| {
+            let expert = expert(global_expert)?;
+            Ok((&expert.dense.gate_up_proj, &expert.dense.down_proj))
+        })
+        .collect()
+}
+
 fn load_dense_mlp(
     ctx: &DeviceContext,
     shards: &[safetensors::SafeTensors<'_>],
