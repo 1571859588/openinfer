@@ -34,8 +34,9 @@ pub struct SchedulerMetrics {
     /// `hit_rate = hits/queries` stays in [0, 1].
     pub prefix_cache_hits: u64,
     /// Cumulative queries against the external/connector side (CPU-offload and
-    /// P2P restore), in tokens. These are looked up alongside the local cache,
-    /// so the count tracks `prefix_cache_queries`.
+    /// P2P restore), in tokens: the prompt minus the local hits, so a locally
+    /// cached token is not in the external denominator. Stays at zero when the
+    /// engine consulted no connector.
     pub prefix_cache_external_queries: u64,
     /// Cumulative hits served from the external/connector side rather than from
     /// local KV, in tokens. Mapped to

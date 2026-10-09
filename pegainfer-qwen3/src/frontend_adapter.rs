@@ -243,21 +243,22 @@ pub(crate) struct Qwen3Scheduler<E: ModelExecutor> {
     /// it cannot run against an adapter set the command was about to change.
     pending_control: VecDeque<LoraControl>,
     post_control_deferred: Vec<PendingRequest>,
-    /// Cumulative prefix-cache queries (one per admitted request that reached
-    /// its first prefill chunk). Monotonic; reported verbatim in `SchedulerMetrics`.
+    /// Cumulative prefix-cache queries, in tokens: every admitted request adds
+    /// its prompt length once, on its first prefill chunk. Monotonic; reported
+    /// verbatim in `SchedulerMetrics`.
     prefix_cache_queries: u64,
-    /// Cumulative prefix-cache hits, token-granularity (the total number of
-    /// queried prompt tokens that were already cached, summed across requests).
-    /// Same unit as `prefix_cache_queries`, so `hit_rate = hits/queries` ∈ [0, 1].
-    /// Monotonic; the bridge exports per-send deltas of this total (see
-    /// `scheduler_stats_from` / the stepped bridge) so Prometheus does not
-    /// re-add the running total on every token batch.
+    /// Cumulative prefix-cache hits, in tokens: of the queried tokens, those
+    /// already cached locally. Same unit as `prefix_cache_queries`, so
+    /// `hit_rate = hits/queries` stays in [0, 1]. Monotonic; the bridge exports
+    /// per-send deltas of this total so Prometheus does not re-add the running
+    /// total on every token batch.
     prefix_cache_hits: u64,
-    /// Cumulative external-side queries/hits, in tokens: blocks restored from
-    /// CPU offload or P2P rather than found in local KV. Queried alongside the
-    /// local cache, so `prefix_cache_external_queries` tracks
-    /// `prefix_cache_queries`.
+    /// Cumulative external-side queries, in tokens: only what the local cache
+    /// did not answer (`prompt - local`), and only for a request whose
+    /// connector was consulted. Zero on a server with no offload.
     prefix_cache_external_queries: u64,
+    /// Cumulative external-side hits, in tokens: of the tokens above, those the
+    /// connector actually restored.
     prefix_cache_external_hits: u64,
 }
 

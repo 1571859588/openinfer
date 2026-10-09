@@ -48,6 +48,8 @@ const SPEC_K: usize = 3;
 const SPEC_ACCEPTED: usize = 2;
 const PREFIX_METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-prefix-metrics";
 const ABORT_METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-abort-metrics";
+const PREFIX_MISS_METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-prefix-miss-metrics";
+const PREFIX_LOGPROBS_MODEL_NAME: &str = "pegainfer-sim-e2e-prefix-logprobs-metrics";
 /// Long enough that a request is admitted (counting its lookup) well before it
 /// can emit a token, so abandoning it leaves a delta with no output to ride.
 const ABORT_TTFT_MS: f64 = 400.0;
@@ -101,12 +103,32 @@ impl SimServer {
     /// scripted prefix lookup, so the stepped bridge has prefix-cache counters
     /// (local and external) to stamp onto its batches.
     async fn spawn_with_prefix_cache() -> Result<Self> {
+        Self::spawn_with_prefix_cache_as(PREFIX_METRICS_MODEL_NAME).await
+    }
+
+    /// As `spawn_with_prefix_cache`, under a caller-chosen model name. Each
+    /// server gets its own name because they share one process-wide Prometheus
+    /// registry: two tests driving the same `model_name` would add into the
+    /// same series and each would then see the other's totals.
+    async fn spawn_with_prefix_cache_as(model_name: &'static str) -> Result<Self> {
         Self::spawn_with_config(
             model_dir_with_minimal_metadata()?,
             1,
-            PREFIX_METRICS_MODEL_NAME,
+            model_name,
             SimulatedEngineConfig::new(0.0, 1000.0, 0.0, 1)?
                 .with_prefix_cache(PREFIX_LOCAL_HITS, PREFIX_EXTERNAL_HITS),
+        )
+        .await
+    }
+
+    /// As above, but the scripted lookup matches nothing, so the counters must
+    /// show a query with no hit rather than a cache that was never asked.
+    async fn spawn_with_miss_prefix_cache() -> Result<Self> {
+        Self::spawn_with_config(
+            model_dir_with_minimal_metadata()?,
+            1,
+            PREFIX_MISS_METRICS_MODEL_NAME,
+            SimulatedEngineConfig::new(0.0, 1000.0, 0.0, 1)?.with_prefix_cache(0, 0),
         )
         .await
     }
@@ -723,6 +745,9 @@ async fn stepped_bridge_reports_prefix_cache_counters_to_prometheus() -> Result<
         .error_for_status()?;
 
     let queries = PREFIX_PROMPT as f64;
+    // vLLM measures the connector query as what the local cache did not
+    // answer, so a locally cached token is not in the external denominator.
+    let external_queries = (PREFIX_PROMPT - PREFIX_LOCAL_HITS) as f64;
     wait_for_metrics(
         &client,
         &server.base_url,
@@ -733,7 +758,11 @@ async fn stepped_bridge_reports_prefix_cache_counters_to_prometheus() -> Result<
                 "0",
                 PREFIX_LOCAL_HITS as f64,
             ),
-            ("vllm:external_prefix_cache_queries_total", "0", queries),
+            (
+                "vllm:external_prefix_cache_queries_total",
+                "0",
+                external_queries,
+            ),
             (
                 "vllm:external_prefix_cache_hits_total",
                 "0",
@@ -767,12 +796,24 @@ async fn aborted_request_still_ships_its_prefix_lookup() -> Result<()> {
     .to_string();
 
     // Abandoned mid-prefill: admitted (so its lookup was counted), never served.
-    let _ = abandoning
+    // Asserting the timeout is what keeps this an abort rather than a normal
+    // completion — with `let _ =` the test would also pass if it finished.
+    match abandoning
         .post(format!("{}/v1/completions", server.base_url))
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(body.clone())
         .send()
-        .await;
+        .await
+    {
+        Ok(response) => panic!(
+            "the abandoned request was served instead of timing out: {}",
+            response.status()
+        ),
+        Err(error) => assert!(
+            error.is_timeout(),
+            "the abandoned request failed for the wrong reason: {error}"
+        ),
+    }
 
     // A second request drives the next step — the moment a stranded delta would
     // be flushed, and the moment a re-sent one would double the total.
@@ -784,16 +825,162 @@ async fn aborted_request_still_ships_its_prefix_lookup() -> Result<()> {
         .await?
         .error_for_status()?;
 
-    // Both lookups are present exactly once: 2 x PREFIX_PROMPT, not just the
-    // survivor's, and not a delta replayed on top of it.
+    // All four families carry both lookups exactly once. Only the second
+    // request emits tokens, yet the first one's lookup must land too: the
+    // totals are those of two admitted requests, split into the local hits and
+    // the externally-restored hits, with no delta replayed on top.
+    let queries = 2.0 * PREFIX_PROMPT as f64;
+    let external_queries = 2.0 * (PREFIX_PROMPT - PREFIX_LOCAL_HITS) as f64;
     wait_for_metrics(
         &client,
         &server.base_url,
-        &[(
-            "vllm:prefix_cache_queries_total",
-            "0",
-            2.0 * PREFIX_PROMPT as f64,
-        )],
+        &[
+            ("vllm:prefix_cache_queries_total", "0", queries),
+            (
+                "vllm:prefix_cache_hits_total",
+                "0",
+                2.0 * PREFIX_LOCAL_HITS as f64,
+            ),
+            (
+                "vllm:external_prefix_cache_queries_total",
+                "0",
+                external_queries,
+            ),
+            (
+                "vllm:external_prefix_cache_hits_total",
+                "0",
+                2.0 * PREFIX_EXTERNAL_HITS as f64,
+            ),
+        ],
+        &server.model_name,
+    )
+    .await?;
+
+    server.shutdown().await
+}
+
+/// A cache that is asked and misses is different from one that is never asked,
+/// and the counters must keep them apart: the query advances while the hit
+/// stays at zero. Counting hits alone would report a 100% hit rate for a cache
+/// that never warms.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prefix_cache_miss_counts_its_query_without_a_hit() -> Result<()> {
+    let server = SimServer::spawn_with_miss_prefix_cache().await?;
+    let client = test_client()?;
+
+    let body = json!({
+        "model": server.model_name,
+        "prompt": vec![1u32; PREFIX_PROMPT],
+        "max_tokens": 1,
+        "temperature": 0.0,
+        "ignore_eos": true,
+    });
+
+    client
+        .post(format!("{}/v1/completions", server.base_url))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body.to_string())
+        .send()
+        .await?
+        .error_for_status()?;
+
+    // The whole prompt was queried and nothing came back locally. With no local
+    // hit to subtract, the connector was asked about all of it and restored
+    // none — every family is present, but only the queries move.
+    wait_for_metrics(
+        &client,
+        &server.base_url,
+        &[
+            ("vllm:prefix_cache_queries_total", "0", PREFIX_PROMPT as f64),
+            ("vllm:prefix_cache_hits_total", "0", 0.0),
+            (
+                "vllm:external_prefix_cache_queries_total",
+                "0",
+                PREFIX_PROMPT as f64,
+            ),
+            ("vllm:external_prefix_cache_hits_total", "0", 0.0),
+        ],
+        &server.model_name,
+    )
+    .await?;
+
+    server.shutdown().await
+}
+
+/// A prompt-scoring request forwards its prompt whole instead of consulting the
+/// prefix cache, so it must move none of the four families — on a server that
+/// does report a lookup for ordinary requests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prompt_logprobs_request_counts_no_prefix_lookup() -> Result<()> {
+    let server = SimServer::spawn_with_prefix_cache_as(PREFIX_LOGPROBS_MODEL_NAME).await?;
+    let client = test_client()?;
+
+    // Establish that this engine does count, so the zeroes below cannot come
+    // from a server that never counts anything.
+    client
+        .post(format!("{}/v1/completions", server.base_url))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(
+            json!({
+                "model": server.model_name,
+                "prompt": vec![1u32; PREFIX_PROMPT],
+                "max_tokens": 1,
+                "temperature": 0.0,
+                "ignore_eos": true,
+            })
+            .to_string(),
+        )
+        .send()
+        .await?
+        .error_for_status()?;
+    wait_for_metrics(
+        &client,
+        &server.base_url,
+        &[("vllm:prefix_cache_queries_total", "0", PREFIX_PROMPT as f64)],
+        &server.model_name,
+    )
+    .await?;
+
+    // Same prompt, but scored: no lookup runs, so the totals must not move.
+    // They are cumulative, so a second lookup would show up as `2 * PROMPT`.
+    client
+        .post(format!("{}/v1/completions", server.base_url))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(
+            json!({
+                "model": server.model_name,
+                "prompt": vec![1u32; PREFIX_PROMPT],
+                "max_tokens": 1,
+                "temperature": 0.0,
+                "prompt_logprobs": 0,
+            })
+            .to_string(),
+        )
+        .send()
+        .await?
+        .error_for_status()?;
+
+    wait_for_metrics(
+        &client,
+        &server.base_url,
+        &[
+            ("vllm:prefix_cache_queries_total", "0", PREFIX_PROMPT as f64),
+            (
+                "vllm:prefix_cache_hits_total",
+                "0",
+                PREFIX_LOCAL_HITS as f64,
+            ),
+            (
+                "vllm:external_prefix_cache_queries_total",
+                "0",
+                (PREFIX_PROMPT - PREFIX_LOCAL_HITS) as f64,
+            ),
+            (
+                "vllm:external_prefix_cache_hits_total",
+                "0",
+                PREFIX_EXTERNAL_HITS as f64,
+            ),
+        ],
         &server.model_name,
     )
     .await?;
