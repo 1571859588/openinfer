@@ -126,38 +126,37 @@ fn resolve_prefill_outputs(
         // Report the prefix-cache counters on the request's first chunk only —
         // that is where they are determined. Later chunks must not re-report.
         //
-        // Only count a request whose prefix the executor actually looked up.
-        // The executor calls `match_and_add_prefix` strictly under
-        // `prefix_cache_enabled() && !echo`, so a cache-disabled or echo
-        // request performs no lookup at all and must contribute neither a
-        // query nor a hit — otherwise the counters report lookups that never
-        // happened and the hit rate is diluted by phantom queries.
-        //
-        // Both counters are TOKEN-granularity, matching vLLM's `PrefixCacheStats`
-        // (the frontend compares `hits / queries` as hit tokens / queried tokens):
-        //   * `prefix_queries` = the number of prompt tokens this request looked
-        //     up in the cache (the whole prompt is consulted once, on chunk 0).
-        //   * `prefix_hits`    = the number of those tokens already cached
-        //     (`cached_tokens`).
-        // Because `cached_tokens <= prompt_tokens`, `hits <= queries` holds and
-        // the hit rate stays in [0, 1] with no impossible >100% rates.
+        // Both counter pairs are TOKEN-granular, matching vLLM's
+        // `PrefixCacheStats` (the frontend reads them as hit tokens / queried
+        // tokens). Whether a lookup ran at all is the executor's call, and it
+        // reports that here rather than the resolver re-deriving it.
         if req.prefill_pos == 0 {
-            // The cached-token report drives the `cached_tokens` usage field
-            // and stays unconditional: it reports what the executor reused,
-            // which is simply zero when no lookup happened.
+            // The usage field reports what the executor reused, so it stays
+            // unconditional and simply reads zero when nothing was looked up.
             effects.cached.push(CachedTokensEffect {
                 request_id: req.request_id,
                 cached_tokens: result.cached_tokens.unwrap_or(0),
             });
-            // `None` means no lookup ran at all (cache disabled, or an echo
-            // request), so nothing is counted — the executor owns that
-            // condition and reports it here rather than the resolver
-            // re-deriving it. `Some(0)` is a miss: the query still counts.
+            // `Some(matched)` is a lookup that ran — `Some(0)` is a miss, which
+            // still counts its query. `None` is no lookup at all, and
+            // contributes nothing, so the rate is not diluted by phantom
+            // queries. Whatever the connector restored is excluded here and
+            // attributed to the external family below.
             if let Some(matched) = result.cached_tokens {
-                let external = result.external_hit_tokens.min(matched);
+                // Whatever the connector restored is not a local hit.
+                let local = matched.saturating_sub(result.external_hit_tokens.unwrap_or(0));
                 effects.prefix_queries += req.prompt_tokens.len() as u64;
-                effects.prefix_hits += (matched - external) as u64;
-                effects.prefix_external_queries += req.prompt_tokens.len() as u64;
+                effects.prefix_hits += local as u64;
+            }
+            // The external family is separate, and exists only when a
+            // connector was consulted for this request: a server with no
+            // offload reports nothing here. vLLM measures the connector query
+            // as the prompt minus the local hits, so a locally cached token
+            // never inflates the external denominator.
+            if let Some(external) = result.external_hit_tokens {
+                let local = result.cached_tokens.unwrap_or(0).saturating_sub(external);
+                effects.prefix_external_queries +=
+                    req.prompt_tokens.len().saturating_sub(local) as u64;
                 effects.prefix_external_hits += external as u64;
             }
         }

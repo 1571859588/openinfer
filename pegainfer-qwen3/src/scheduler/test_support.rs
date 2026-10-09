@@ -50,8 +50,10 @@ pub(crate) struct FakeExecutor {
     // never calls `match_and_add_prefix` and must therefore report no queries.
     prefix_cache_enabled: bool,
     // Tokens of the simulated hit attributed to the external side (CPU offload
-    // / P2P) rather than found in local KV.
-    prefix_external_hit_tokens: usize,
+    // / P2P) rather than found in local KV. `None` models an engine that
+    // consulted no connector for this request, so the external family stays
+    // unreported; `Some(0)` is a probe that restored nothing.
+    prefix_external_hit_tokens: Option<usize>,
 }
 
 impl FakeExecutor {
@@ -72,7 +74,7 @@ impl FakeExecutor {
             emit_logprobs: false,
             prefix_hit_tokens: 0,
             prefix_cache_enabled: true,
-            prefix_external_hit_tokens: 0,
+            prefix_external_hit_tokens: None,
         }
     }
 
@@ -90,10 +92,10 @@ impl FakeExecutor {
         self
     }
 
-    /// Simulate hits restored from the external side (CPU offload / P2P) rather
-    /// than found in local KV.
+    /// Simulate a connector that was consulted for every request and restored
+    /// `tokens` externally. Without this the external family reports nothing.
     pub(crate) fn with_external_prefix_hit(mut self, tokens: usize) -> Self {
-        self.prefix_external_hit_tokens = tokens;
+        self.prefix_external_hit_tokens = Some(tokens);
         self
     }
 
@@ -153,13 +155,16 @@ impl FakeExecutor {
             prompt_logprobs: None,
             // A simulated lookup is reported only on the request's first chunk
             // (start == 0); later chunks carry no cached prefix. `None` models
-            // a cache that never ran a lookup (switched off, or echo).
+            // a cache that never ran a lookup (switched off, or prompt
+            // scoring).
             cached_tokens: (start == 0 && self.prefix_cache_enabled)
                 .then_some(self.prefix_hit_tokens),
-            external_hit_tokens: if start == 0 {
+            // The external family is only reported for a request whose
+            // connector was consulted; later chunks contribute nothing.
+            external_hit_tokens: if start == 0 && self.prefix_cache_enabled {
                 self.prefix_external_hit_tokens
             } else {
-                0
+                None
             },
             completed,
             prefill_pos,
@@ -200,9 +205,6 @@ impl ModelExecutor for FakeExecutor {
     fn max_decode_batch_size(&self) -> usize {
         64
     }
-
-    // No capability query: the fake reports `None` from `fake_prefill_result`
-    // when the cache is off, which is what the resolver consumes.
 
     fn available_blocks(&self) -> usize {
         self.available_blocks

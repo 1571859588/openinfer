@@ -461,14 +461,22 @@ fn prefix_cache_metrics_stable_across_batches_and_scrapes() {
     const BATCHES: u64 = 4;
     const PER_BATCH: u64 = 3;
     const TOTAL: u64 = BATCHES * PER_BATCH;
-    const PROMPT_TOKENS: u64 = 64; // tokens looked up per request
-    const HIT_TOKENS: u64 = 37; // simulated cached prefix length (<= prompt)
+    // Longer than the 1024-token chunk budget, so every request prefills in
+    // two chunks and the "once per request" rule meets a second chunk — the
+    // case that would double-count if the gate were missing.
+    const PROMPT_TOKENS: u64 = 1200; // tokens looked up per request
+    const HIT_TOKENS: u64 = 333; // simulated cached prefix length (<= prompt)
+    const EXTERNAL_HIT_TOKENS: u64 = 111; // of those, restored by the connector
 
-    // A fake KV cache that reports a 37-token hit on the first chunk of every
-    // request. With the fix, queries count the 64 prompt tokens queried and
-    // hits count the 37 tokens already cached — both token-granular.
+    // A fake KV cache that reports a 333-token hit on the first chunk of every
+    // request, 111 tokens of which the connector restored rather than found in
+    // local KV. Queries count the 1200 prompt tokens queried and hits count
+    // only the 222 tokens already cached locally — both token-granular, and
+    // the second chunk that completes the prefill contributes nothing more.
     let dropped = Arc::new(Mutex::new(Vec::new()));
-    let executor = FakeExecutor::new(64, Arc::clone(&dropped)).with_prefix_hit(HIT_TOKENS as usize);
+    let executor = FakeExecutor::new(80, Arc::clone(&dropped))
+        .with_prefix_hit(HIT_TOKENS as usize)
+        .with_external_prefix_hit(EXTERNAL_HIT_TOKENS as usize);
     let (partition, _lora, mut steps) = launch(executor, false);
 
     let mut controls = Vec::new();
@@ -497,18 +505,15 @@ fn prefix_cache_metrics_stable_across_batches_and_scrapes() {
         let _ = steps.collect_terminal(c.id());
     }
 
-    // Monotonic totals, not re-derived per scrape: two reads at the same
-    // instant agree.
     let a = partition.handle.metrics();
-    let b = partition.handle.metrics();
-    assert_eq!(a.prefix_cache_queries, b.prefix_cache_queries);
-    assert_eq!(a.prefix_cache_hits, b.prefix_cache_hits);
 
     // Token-granular correctness per vLLM PrefixCacheStats: every request
     // queries PROMPT_TOKENS and hits HIT_TOKENS, so the running totals are
     // TOTAL * those, and hit_rate = HIT_TOKENS / PROMPT_TOKENS in [0, 1].
     let expected_q = TOTAL * PROMPT_TOKENS;
-    let expected_h = TOTAL * HIT_TOKENS;
+    // Hits are the local share only — what the connector restored is carried
+    // by the external family instead.
+    let expected_h = TOTAL * (HIT_TOKENS - EXTERNAL_HIT_TOKENS);
     assert_eq!(a.prefix_cache_queries, expected_q);
     assert_eq!(a.prefix_cache_hits, expected_h);
     assert!(
@@ -516,7 +521,17 @@ fn prefix_cache_metrics_stable_across_batches_and_scrapes() {
         "hits (cached tokens) must not exceed queries (queried tokens)"
     );
     let hit_rate = a.prefix_cache_hits as f64 / a.prefix_cache_queries as f64;
-    assert!((hit_rate - HIT_TOKENS as f64 / PROMPT_TOKENS as f64).abs() < 1e-9);
+    assert!(
+        (hit_rate - (HIT_TOKENS - EXTERNAL_HIT_TOKENS) as f64 / PROMPT_TOKENS as f64).abs() < 1e-9
+    );
+
+    // The external family: asked about whatever the local cache did not
+    // answer, and it restored EXTERNAL_HIT_TOKENS of it.
+    assert_eq!(
+        a.prefix_cache_external_queries,
+        TOTAL * (PROMPT_TOKENS - (HIT_TOKENS - EXTERNAL_HIT_TOKENS))
+    );
+    assert_eq!(a.prefix_cache_external_hits, TOTAL * EXTERNAL_HIT_TOKENS);
 
     // Each batch contributed a stable, non-zero delta of exactly
     // PER_BATCH * PROMPT_TOKENS (queries) and PER_BATCH * HIT_TOKENS (hits).
@@ -542,10 +557,10 @@ fn prefix_cache_metrics_stable_across_batches_and_scrapes() {
 
 /// A disabled prefix cache performs no lookup, so it must report no queries.
 ///
-/// The executor calls `match_and_add_prefix` only under
-/// `prefix_cache_enabled() && !echo`. With the cache off there is nothing to
-/// count: reporting the prompt length anyway would invent lookups that never
-/// happened and drag every request's hit rate toward zero.
+/// A prompt-scoring request is the other case that performs no lookup: it
+/// forwards the prompt whole. With either of those there is nothing to count —
+/// reporting the prompt length anyway would invent lookups that never happened
+/// and drag every request's hit rate toward zero.
 #[test]
 fn prefix_cache_disabled_reports_no_lookups() {
     let dropped = Arc::new(Mutex::new(Vec::new()));

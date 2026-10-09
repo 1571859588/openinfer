@@ -94,11 +94,14 @@ pub struct PrefillStepItem {
     /// Leading prompt tokens whose KV came from the prefix cache.
     /// Set by the executor after matching; the forward pass only computes
     /// the remaining suffix. `None` means no lookup ran (prefix caching off,
-    /// or an echo request), which the metrics path must not count.
+    /// or a prompt-scoring request), which the metrics path must not count.
     pub(crate) cached_tokens: Option<usize>,
     /// How many of those cached tokens came from the external side (CPU
-    /// offload / P2P restore) rather than from local KV.
-    pub(crate) external_hit_tokens: usize,
+    /// offload / P2P restore) rather than from local KV. `None` when no
+    /// connector was consulted for this request at all; `Some(0)` when it was
+    /// consulted and restored nothing. The external `/metrics` family is
+    /// driven by this distinction, not by `cached_tokens`.
+    pub(crate) external_hit_tokens: Option<usize>,
     /// Scheduler-set cap on prompt tokens forwarded this step (chunked
     /// prefill). The executor clamps it to the tokens actually remaining.
     pub(crate) chunk_budget: usize,
@@ -129,7 +132,7 @@ impl PrefillStepItem {
             prompt_logprobs,
             lora_adapter: None,
             cached_tokens: None,
-            external_hit_tokens: 0,
+            external_hit_tokens: None,
             chunk_budget: usize::MAX,
             chunk_start: 0,
             chunk_tokens,
@@ -706,11 +709,14 @@ pub struct PrefillRequestResult {
     pub(crate) prompt_logprobs: Option<Vec<Option<TokenLogprob>>>,
     /// Prompt tokens served from the prefix cache (KV reused, not recomputed).
     /// `None` when no lookup ran at all, which is the fact the /metrics
-    /// counters need: a disabled cache or an echo request counts nothing.
+    /// counters need: a disabled cache or a prompt-scoring request counts
+    /// nothing.
     pub cached_tokens: Option<usize>,
     /// How many of `cached_tokens` were restored from the external side (CPU
-    /// offload / P2P) rather than found in local KV.
-    pub external_hit_tokens: usize,
+    /// offload / P2P) rather than found in local KV. `None` when no
+    /// connector was consulted for this request; `Some(0)` when it was
+    /// consulted and restored nothing.
+    pub external_hit_tokens: Option<usize>,
     /// Whether the prompt is fully prefilled. When false this step ran a
     /// non-final chunk and `first_token` is meaningless.
     pub completed: bool,
@@ -1811,15 +1817,18 @@ impl Qwen3Executor {
             // are never forwarded, so prompt-logprob requests prefill from scratch.
             if self.prefix_cache_enabled() && req.prompt_logprobs.is_none() {
                 let matched = rkv.match_and_add_prefix(self.kv_mgr.pool())?;
-                // Split the match by origin: blocks the probe found in local
-                // GPU KV versus blocks it restored from CPU offload / P2P.
-                // With no probe for this request the whole match is local.
-                let block_size = self.metadata.block_size;
-                let local = self.prefetch.get(&req.request_id).map_or(matched, |state| {
-                    (state.probe.gpu_hit_blocks() * block_size).min(matched)
-                });
                 req.cached_tokens = Some(matched);
-                req.external_hit_tokens = matched.saturating_sub(local);
+                // The probe is what consults the connector, reporting how many
+                // of the matched blocks already sit in local GPU KV; the rest
+                // is what it restored. With no probe there is no external leg
+                // to attribute, so this stays `None` — a probe that restored
+                // nothing is `Some(0)`, and the external family is reported
+                // only when it exists.
+                req.external_hit_tokens = self.prefetch.get(&req.request_id).map(|state| {
+                    let block_size = self.metadata.block_size;
+                    let local = (state.probe.gpu_hit_blocks() * block_size).min(matched);
+                    matched.saturating_sub(local)
+                });
             }
             self.request_kvs.insert(req.request_id, rkv);
             // match_and_add_prefix above already absorbed any CPU-prefetched
@@ -2240,10 +2249,6 @@ impl ModelExecutor for Qwen3Executor {
     fn block_size(&self) -> usize {
         self.metadata.block_size
     }
-
-    // No prefix-cache capability query here on purpose: whether a lookup ran
-    // is reported per request through `PrefillRequestResult::cached_tokens`
-    // rather than re-derived from a capability flag in the resolver.
 
     fn max_request_blocks(&self) -> usize {
         self.kv_mgr.pool().max_request_blocks()

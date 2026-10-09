@@ -33,8 +33,8 @@ pub(super) fn publish_load(
         // mid-resolve and never counts a request twice.
         num_waiting_reqs: (pending.len() + resolving) as u64,
         spec_decode: None,
-        // MLA + MoE line without a prefix cache, so the counters stay at
-        // their neutral zero.
+        // This line has a prefix cache, but it does not report its lookups
+        // yet, so the counters stay at their neutral zero.
         prefix_cache_queries: 0,
         prefix_cache_hits: 0,
         prefix_cache_external_queries: 0,
