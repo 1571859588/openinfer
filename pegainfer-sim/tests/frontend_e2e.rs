@@ -56,7 +56,7 @@ const ABORT_TTFT_MS: f64 = 400.0;
 /// Short enough that the client gives up inside that prefill window.
 const ABORT_CLIENT_TIMEOUT: Duration = Duration::from_millis(60);
 /// The pretend lookup the prefix-metrics server reports on every admitted
-/// non-echo request: 8 prompt tokens queried, 5 found in local KV and 2 of the
+/// ordinary request: 8 prompt tokens queried, 5 found in local KV and 2 of the
 /// remainder restored from the connector.
 const PREFIX_PROMPT: usize = 8;
 const PREFIX_LOCAL_HITS: usize = 5;
@@ -99,9 +99,9 @@ impl SimServer {
         .await
     }
 
-    /// A single engine whose every admitted non-echo request reports a
-    /// scripted prefix lookup, so the stepped bridge has prefix-cache counters
-    /// (local and external) to stamp onto its batches.
+    /// A single engine that reports a scripted prefix lookup on every admitted
+    /// request, so the stepped bridge has prefix-cache counters (local and
+    /// external) to stamp onto its batches.
     async fn spawn_with_prefix_cache() -> Result<Self> {
         Self::spawn_with_prefix_cache_as(PREFIX_METRICS_MODEL_NAME).await
     }
