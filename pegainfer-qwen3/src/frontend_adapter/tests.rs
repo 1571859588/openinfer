@@ -708,7 +708,8 @@ fn prefix_cache_metrics_stable_across_batches_and_scrapes() {
     assert_eq!(a.prefix_cache_external_hits, TOTAL * EXTERNAL_HIT_TOKENS);
 
     // Each batch contributed a stable, non-zero delta of exactly
-    // PER_BATCH * PROMPT_TOKENS (queries) and PER_BATCH * HIT_TOKENS (hits).
+    // PER_BATCH * PROMPT_TOKENS (queries) and PER_BATCH * the LOCAL hits:
+    // what the connector restored is carried by the external family instead.
     let mut prev_q = 0u64;
     let mut prev_h = 0u64;
     for (batch, q, h) in scrapes {
@@ -721,8 +722,8 @@ fn prefix_cache_metrics_stable_across_batches_and_scrapes() {
         );
         assert_eq!(
             dh,
-            PER_BATCH * HIT_TOKENS,
-            "batch {batch} added exactly PER_BATCH*HIT_TOKENS hits"
+            PER_BATCH * (HIT_TOKENS - EXTERNAL_HIT_TOKENS),
+            "batch {batch} added exactly PER_BATCH*(HIT_TOKENS-EXTERNAL_HIT_TOKENS) local hits"
         );
         prev_q = q;
         prev_h = h;
