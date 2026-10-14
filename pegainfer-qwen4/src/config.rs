@@ -594,24 +594,12 @@ mod tests {
         assert_eq!(config().ple_layer, 1);
     }
 
-    /// The table geometry is derived from config alone and must reproduce what
-    /// the frozen checkpoint actually stores.
+    /// The table totals, which neither the stored vectors nor the shard shapes state.
     #[test]
     fn the_ngram_table_derivation_matches_the_checkpoint() {
         let ngram = config().ngram;
-        assert_eq!(ngram.heads, 16);
-        assert_eq!(ngram.head_dim, 160);
-        assert_eq!(ngram.head_vocab_sizes.len(), 16);
-        assert_eq!(ngram.head_vocab_sizes[0], 20_000_003);
-        assert!(
-            ngram.head_vocab_sizes.windows(2).all(|w| w[1] > w[0]),
-            "per-head vocabularies are increasing primes"
-        );
-        assert_eq!(ngram.head_offsets[0], 0);
         assert_eq!(ngram.total_vocab_size, 320_001_446);
         assert_eq!(ngram.padded_vocab_size, 320_001_536);
-        assert_eq!(ngram.shards, 128);
-        assert_eq!(ngram.rows_per_shard, 2_500_012);
     }
 
     #[test]
@@ -876,5 +864,20 @@ mod tests {
     fn an_embed_dim_that_cannot_split_across_heads_is_refused() {
         let err = err(|c| text(c, "ple_embed_dim", serde_json::json!(2561)));
         assert!(err.contains("ple_embed_dim"), "{err}");
+    }
+
+    #[test]
+    fn the_ngram_partition_equals_the_stored_integer_vectors() {
+        let stored = crate::manifest::frozen_tensors().values;
+        let ngram = config().ngram;
+        let embedding = "model.language_model.layers.1.ple.ple_embedding";
+        assert_eq!(
+            stored[&format!("{embedding}.ngram_heads_vocab_sizes")],
+            ngram.head_vocab_sizes
+        );
+        assert_eq!(
+            stored[&format!("{embedding}.ngram_heads_offsets")],
+            ngram.head_offsets
+        );
     }
 }

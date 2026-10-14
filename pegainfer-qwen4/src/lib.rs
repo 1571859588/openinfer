@@ -1,15 +1,16 @@
-//! The Qwen4 architecture preview (`qwen4_exp`): line detection and validated
-//! geometry. Its first checkpoint is Qwen3.8-Flash-Next; the frozen revision and
-//! the reference release are recorded in `docs/models/qwen4/bring-up.md`.
+//! The Qwen4 architecture preview (`qwen4_exp`): line detection, validated geometry
+//! and the tensor contract. First checkpoint `Qwen/Qwen3.8-Flash-Next`, recorded in
+//! `docs/models/qwen4/bring-up.md`.
 //!
-//! This crate carries **no CUDA dependency at all**, which is why its probe and
-//! config tests run with no device, no weights and no Triton-equipped build.
-//! Slice B (text-graph assembly and the decode step) adds the device side behind a
-//! crate feature of its own; the modules below then move behind
-//! `#[cfg(any(<that feature>, test))]` the way `pegainfer-gemma4/src/lib.rs` does,
-//! so this property survives.
+//! No CUDA dependency at all, so its probe, config and manifest tests run with no
+//! device, no weights and no Triton build. Slice B adds the device side behind a
+//! feature of its own, and these modules then move behind
+//! `#[cfg(any(<that feature>, test))]` the way `pegainfer-gemma4/src/lib.rs` does.
 
 mod config;
+// Only tests read the contract until slice B's loader checks a checkpoint with it.
+#[cfg(test)]
+mod manifest;
 pub mod model_line;
 mod probe;
 

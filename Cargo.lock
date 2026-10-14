@@ -3897,6 +3897,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "pegainfer-frontend",
+ "safetensors",
  "serde",
  "serde_json",
  "sha2 0.11.0",
