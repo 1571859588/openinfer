@@ -560,7 +560,7 @@ fn tune_decode_gemm_algos(
 
     let ctx = model.device_ctx();
     let hidden = model.config().hidden_size;
-    let vocab = model.config().vocab_size;
+    let logits_rows = model.config().logits_rows;
     let q_dim = model.local_q_dim();
     let kv_dim = model.local_kv_dim();
     let intermediate = model.local_intermediate_size();
@@ -573,7 +573,7 @@ fn tune_decode_gemm_algos(
             q_dim,
             kv_dim,
             intermediate,
-            vocab,
+            logits_rows,
         )?;
         let max_context = model.config().max_position_embeddings;
         log::info!(
@@ -623,7 +623,7 @@ fn tune_decode_gemm_algos(
         ops::gemm_lt_tune(ctx, &o_samples, hidden, n)?;
         ops::gemm_lt_tune(ctx, &gate_up_samples, intermediate, n)?;
         ops::gemm_lt_tune(ctx, &down_samples, hidden, n)?;
-        ops::gemm_lt_tune(ctx, &lm_head_samples, vocab, n)?;
+        ops::gemm_lt_tune(ctx, &lm_head_samples, logits_rows, n)?;
     }
     Ok(())
 }
@@ -643,7 +643,7 @@ fn verify_pin_envelope(model: &Qwen3Model, max_prefill_tokens: usize) -> Result<
     // Unified-N peak: one prefill chunk (≤ max_prefill_tokens) + (max_bucket−1) concurrent decoders;
     // rests on max_decode_batch_size == BATCH_BUCKETS.last().
     let ceiling = max_prefill_tokens + (*BATCH_BUCKETS.last().unwrap()).saturating_sub(1);
-    // lm_head (vocab×hidden) runs on the sampled-position count, not the token count: decode-only
+    // lm_head (logits_rows×hidden) runs on the sampled-position count, not the token count: decode-only
     // pads to a bucket (≤ max_decode_batch_size) and unified gathers ≤ that many requests, while
     // all-position scoring runs up to max_prefill_tokens — true max N = max(max_prefill, max_decode_batch).
     let lm_head_max_n = max_prefill_tokens.max(*BATCH_BUCKETS.last().unwrap());
@@ -652,7 +652,7 @@ fn verify_pin_envelope(model: &Qwen3Model, max_prefill_tokens: usize) -> Result<
         q_dim,
         kv_dim,
         intermediate,
-        model.config().vocab_size,
+        model.config().logits_rows,
     );
     // Per-shape N upper bound, in the same lm_head-last order as `shapes`: the unified-N peak for
     // every projection, the sampled-position count for lm_head.
@@ -1266,8 +1266,11 @@ impl Qwen3Executor {
             let max_verify_batch = *BATCH_BUCKETS.last().unwrap();
             let (dflash_kv_bytes_per_token, hedge_scratch_pages) = match dflash_draft_path {
                 Some(path) => {
-                    let reservation =
-                        crate::dflash::DFlashMemoryReservation::from_path(path, max_verify_batch)?;
+                    let reservation = crate::dflash::DFlashMemoryReservation::from_path(
+                        path,
+                        model.config().logits_rows,
+                        max_verify_batch,
+                    )?;
                     memory_options.kv_cache_memory_margin_bytes = crate::sizing::sum(&[
                         memory_options.kv_cache_memory_margin_bytes,
                         reservation.fixed_bytes,
@@ -3201,7 +3204,7 @@ impl LocalQwen3Lane {
             model.local_q_dim(),
             model.local_kv_dim(),
             model.local_intermediate_size(),
-            model.config().vocab_size,
+            model.config().logits_rows,
             max_bucket,
             buf_layout.page_size,
             padding_block_id,
@@ -3209,9 +3212,10 @@ impl LocalQwen3Lane {
             model.config().max_position_embeddings,
             model.fused_decode_qkv(),
         )?;
-        let sample_scratch = pegainfer_sample::SampleScratch::new(
+        let sample_scratch = pegainfer_sample::SampleScratch::with_selection_width(
             model.device_ctx(),
-            model.config().vocab_size,
+            model.config().logits_rows,
+            model.config().decodable_vocab,
             max_bucket,
         )?;
         Ok(Self {
@@ -3378,9 +3382,10 @@ impl LocalQwen3Lane {
         sample_seed: u64,
     ) -> Result<Vec<u32>> {
         if params.len() > self.sample_scratch.max_rows() {
-            self.sample_scratch = pegainfer_sample::SampleScratch::new(
+            self.sample_scratch = pegainfer_sample::SampleScratch::with_selection_width(
                 self.model.device_ctx(),
-                self.model.config().vocab_size,
+                self.model.config().logits_rows,
+                self.model.config().decodable_vocab,
                 params.len(),
             )?;
         }
