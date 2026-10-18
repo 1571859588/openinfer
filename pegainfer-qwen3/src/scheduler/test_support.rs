@@ -210,6 +210,14 @@ impl FakeExecutor {
             } else {
                 None
             },
+            // The connector is asked about whatever was not already local.
+            external_query_tokens: if start == 0 {
+                self.prefix_hit_tokens
+                    .zip(self.prefix_external_hit_tokens)
+                    .map(|(hit, external)| req.prompt_tokens.len() - hit.saturating_sub(external))
+            } else {
+                None
+            },
             completed,
             prefill_pos,
         }

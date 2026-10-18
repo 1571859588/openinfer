@@ -152,11 +152,14 @@ fn resolve_prefill_outputs(
             // connector was consulted for this request: a server with no
             // offload reports nothing here. vLLM measures the connector query
             // as the prompt minus the local hits, so a locally cached token
-            // never inflates the external denominator.
-            if let Some(external) = result.external_hit_tokens {
-                let local = result.cached_tokens.unwrap_or(0).saturating_sub(external);
-                effects.prefix_external_queries +=
-                    req.prompt_tokens.len().saturating_sub(local) as u64;
+            // never inflates the external denominator. The executor fixes that
+            // width when the query is issued: a deferred request's local match
+            // can grow before admission, and must not shrink the query
+            // already sent.
+            if let Some((external, queried)) =
+                result.external_hit_tokens.zip(result.external_query_tokens)
+            {
+                effects.prefix_external_queries += queried as u64;
                 effects.prefix_external_hits += external as u64;
             }
         }

@@ -222,6 +222,7 @@ fn inflight_prefill_reservation_is_unchanged_by_its_result() {
                 // No lookup ran for this chunk, so neither leg is reported.
                 cached_tokens: None,
                 external_hit_tokens: None,
+                external_query_tokens: None,
                 completed: prefill_pos == req.prompt_tokens.len(),
                 prefill_pos,
             }],
@@ -243,6 +244,46 @@ fn inflight_prefill_reservation_is_unchanged_by_its_result() {
             "applying the result neither frees nor double counts the reservation"
         );
     }
+}
+
+/// A request is offered to the connector once and may stay deferred while
+/// another request registers the same prefix locally. The external query
+/// total must count the query that was sent, not one re-derived from the
+/// larger admission-time match.
+#[test]
+fn external_queries_use_the_query_time_width() {
+    let executor = FakeExecutor::new(64, Arc::new(Mutex::new(Vec::new())));
+    let req = PendingRequest::from_request(RequestId::new(1), request(96, 4));
+    let result = PrefillResult {
+        requests: vec![PrefillRequestResult {
+            request_id: req.request_id,
+            first_token: 100,
+            first_token_logprob: None,
+            prompt_logprobs: None,
+            // 64 tokens turned up locally by admission time; the connector,
+            // asked while nothing was local, missed.
+            cached_tokens: Some(64),
+            external_hit_tokens: Some(0),
+            external_query_tokens: Some(96),
+            completed: true,
+            prefill_pos: 96,
+        }],
+        dflash_context_captured_requests: Vec::new(),
+    };
+    let artifacts = plan::ExecutionArtifacts::Prefill {
+        pending: vec![req],
+        result,
+    };
+    let effects = resolve::resolve_step(&executor, &[], artifacts);
+    assert_eq!((effects.prefix_queries, effects.prefix_hits), (96, 64));
+    assert_eq!(
+        (
+            effects.prefix_external_queries,
+            effects.prefix_external_hits
+        ),
+        (96, 0),
+        "the connector was asked about the whole prompt"
+    );
 }
 
 #[test]
