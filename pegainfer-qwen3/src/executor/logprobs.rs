@@ -81,7 +81,6 @@ pub(super) fn build_prefill_request_results(
                 // Carried through from the lookup so the metrics path can
                 // split the local and externally restored shares.
                 external_hit_tokens: req.external_hit_tokens,
-                external_query_tokens: req.external_query_tokens,
                 completed: req.is_final_chunk(),
                 prefill_pos: req.chunk_start + req.chunk_tokens,
             },

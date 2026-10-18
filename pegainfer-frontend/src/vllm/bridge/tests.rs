@@ -572,14 +572,7 @@ async fn load_snapshots_become_stats_only_batches() {
         num_running_reqs: 2,
         num_waiting_reqs: 1,
         spec_decode: None,
-<<<<<<< HEAD
         prefix_cache: None,
-=======
-        prefix_cache_queries: 0,
-        prefix_cache_hits: 0,
-        prefix_cache_external_queries: 0,
-        prefix_cache_external_hits: 0,
->>>>>>> 6c3961a1 (feat(observability): attribute externally restored prefix hits separately)
     });
     let (output_tx, mut output_rx) = mpsc::unbounded_channel();
     let shutdown = CancellationToken::new();

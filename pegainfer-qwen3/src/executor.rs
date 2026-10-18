@@ -99,13 +99,11 @@ pub struct PrefillStepItem {
     /// How many of those cached tokens came from the external side (CPU
     /// offload / P2P restore) rather than from local KV. `None` when no
     /// connector was consulted for this request at all; `Some(0)` when it was
-    /// consulted and restored nothing. The external `/metrics` family is
-    /// driven by this distinction, not by `cached_tokens`.
+    /// consulted and restored nothing. The scheduler subtracts it from
+    /// `cached_tokens` so restored blocks never count as local hits; the
+    /// external family itself is counted by the executor (see
+    /// [`ConnectorLookupCounters`]).
     pub(crate) external_hit_tokens: Option<usize>,
-    /// Prompt tokens the connector was asked about: the prompt minus what
-    /// sat in local KV when the query was issued. Set exactly when
-    /// `external_hit_tokens` is; it is the external family's denominator.
-    pub(crate) external_query_tokens: Option<usize>,
     /// Scheduler-set cap on prompt tokens forwarded this step (chunked
     /// prefill). The executor clamps it to the tokens actually remaining.
     pub(crate) chunk_budget: usize,
@@ -137,7 +135,6 @@ impl PrefillStepItem {
             lora_adapter: None,
             cached_tokens: None,
             external_hit_tokens: None,
-            external_query_tokens: None,
             chunk_budget: usize::MAX,
             chunk_start: 0,
             chunk_tokens,
@@ -712,6 +709,21 @@ pub struct UnifiedPlan<'a> {
     pub sample_seed: u64,
 }
 
+/// Cumulative connector (CPU offload / P2P) lookup counters, in tokens. A
+/// request's lookup is settled exactly once, whether it reaches its first
+/// prefill or leaves before it (cancelled, rejected, failed), so a lookup is
+/// never lost with the request that made it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ConnectorLookupCounters {
+    /// Prompt tokens the connector was asked about, fixed when the query was
+    /// issued: the prompt minus what sat in local KV at that moment.
+    pub queries: u64,
+    /// Of those, the tokens a committed load restored and the request's first
+    /// prefill matched. A request that leaves before its first prefill used
+    /// nothing it loaded.
+    pub hits: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct PrefillRequestResult {
     pub(crate) request_id: RequestId,
@@ -728,10 +740,6 @@ pub struct PrefillRequestResult {
     /// connector was consulted for this request; `Some(0)` when it was
     /// consulted and restored nothing.
     pub external_hit_tokens: Option<usize>,
-    /// Prompt tokens the connector was asked about, fixed when the query was
-    /// issued (the prompt minus the local KV hit at that moment). Set exactly
-    /// when `external_hit_tokens` is.
-    pub external_query_tokens: Option<usize>,
     /// Whether the prompt is fully prefilled. When false this step ran a
     /// non-final chunk and `first_token` is meaningless.
     pub completed: bool,
@@ -797,6 +805,12 @@ pub(crate) trait ModelExecutor: Send {
     /// model is loaded.
     fn spec_decode_counters(&self) -> Option<SpecDecodeCounters> {
         None
+    }
+
+    /// Cumulative connector lookup counters. Zero for an executor that never
+    /// consults a connector.
+    fn connector_lookup_counters(&self) -> ConnectorLookupCounters {
+        ConnectorLookupCounters::default()
     }
 
     /// Whether `request_id` has captured draft context and can be drafted.
@@ -949,7 +963,11 @@ pub struct Qwen3Executor {
     /// than re-derived at admission: a request is offered to the connector
     /// once and may stay deferred while the local cache grows, so the
     /// admission-time match no longer describes the query that was sent.
+    /// Each entry is settled into `connector_lookups` exactly once, by
+    /// [`Qwen3Executor::settle_connector_lookup`].
     connector_consulted: HashMap<RequestId, usize>,
+    /// Cumulative external-side lookup counters; see [`ConnectorLookupCounters`].
+    connector_lookups: ConnectorLookupCounters,
     /// Offload pure-L2 mode. When set, completed blocks are not kept for
     /// cross-request HBM reuse: the prefetch probe drains the inactive pool
     /// first, so every probe sees `gpu_hit == 0` and the whole cacheable prefix
@@ -1178,6 +1196,7 @@ impl Qwen3Executor {
             saved_cursor: HashMap::new(),
             prefetch: HashMap::new(),
             connector_consulted: HashMap::new(),
+            connector_lookups: ConnectorLookupCounters::default(),
             l1_retention_disabled: false,
             // Derived here, not via a post-construction setter, so every
             // launch path (plain and LoRA alike) honors the P/D contract.
@@ -1586,6 +1605,7 @@ impl Qwen3Executor {
             saved_cursor: HashMap::new(),
             prefetch: HashMap::new(),
             connector_consulted: HashMap::new(),
+            connector_lookups: ConnectorLookupCounters::default(),
             l1_retention_disabled: false,
             flush_offload_on_finish: false,
             vllm_compat: None,
@@ -1601,6 +1621,24 @@ impl Qwen3Executor {
 
     pub fn drop_request(&mut self, request_id: RequestId) -> Result<()> {
         <Self as ModelExecutor>::drop_request(self, request_id)
+    }
+
+    pub fn connector_lookup_counters(&self) -> ConnectorLookupCounters {
+        <Self as ModelExecutor>::connector_lookup_counters(self)
+    }
+
+    /// The one place a connector lookup reaches the counters: consume the
+    /// request's consulted marker and add its query width and `external_hits`.
+    /// Both exits a consulted request can take — its first prefill and an
+    /// early drop — pass through here, and consuming the marker makes any
+    /// later call a no-op. Returns whether a lookup was settled.
+    fn settle_connector_lookup(&mut self, request_id: RequestId, external_hits: usize) -> bool {
+        let Some(queried) = self.connector_consulted.remove(&request_id) else {
+            return false;
+        };
+        self.connector_lookups.queries += queried as u64;
+        self.connector_lookups.hits += external_hits as u64;
+        true
     }
 
     pub fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult> {
@@ -1864,15 +1902,14 @@ impl Qwen3Executor {
                 // (a scratch prefill, a released lease) restored nothing.
                 // `None` means no connector was consulted at all, so there is
                 // no external leg to report.
-                if let Some(&queried) = self.connector_consulted.get(&req.request_id) {
-                    let block_size = self.metadata.block_size;
-                    let external = self.prefetch.get(&req.request_id).map_or(0, |state| {
-                        let gpu_hit = state.probe.gpu_hit_blocks();
-                        let loaded = state.probe.held_blocks() - gpu_hit;
-                        (loaded * block_size).min(matched.saturating_sub(gpu_hit * block_size))
-                    });
+                let block_size = self.metadata.block_size;
+                let external = self.prefetch.get(&req.request_id).map_or(0, |state| {
+                    let gpu_hit = state.probe.gpu_hit_blocks();
+                    let loaded = state.probe.held_blocks() - gpu_hit;
+                    (loaded * block_size).min(matched.saturating_sub(gpu_hit * block_size))
+                });
+                if self.settle_connector_lookup(req.request_id, external) {
                     req.external_hit_tokens = Some(external);
-                    req.external_query_tokens = Some(queried);
                 }
             }
             self.request_kvs.insert(req.request_id, rkv);
@@ -1880,7 +1917,10 @@ impl Qwen3Executor {
             // blocks (now held by the request's sequence), so release the
             // prefetch's separate hold.
             self.prefetch.remove(&req.request_id);
-            self.connector_consulted.remove(&req.request_id);
+            // A consulted request that skipped the match (prompt scoring)
+            // still asked the connector: settle it as a miss. A no-op once the
+            // branch above has settled it.
+            self.settle_connector_lookup(req.request_id, 0);
         }
         let rkv = self
             .request_kvs
@@ -2379,6 +2419,10 @@ impl ModelExecutor for Qwen3Executor {
         self.spec_decode_counters
     }
 
+    fn connector_lookup_counters(&self) -> ConnectorLookupCounters {
+        self.connector_lookups
+    }
+
     fn is_stop_token(&self, token_id: u32) -> bool {
         self.metadata.stop_token_ids.contains(&token_id)
     }
@@ -2432,9 +2476,11 @@ impl ModelExecutor for Qwen3Executor {
                 let _ = handle.wait();
             }
         }
-        // The request is gone, so drop its consulted marker with it; otherwise
-        // the set would grow without bound.
-        self.connector_consulted.remove(&request_id);
+        // A request that leaves before its first prefill (cancelled while
+        // deferred, rejected, failed) still asked the connector: settle the
+        // lookup as a miss, since it never used what was loaded. A no-op for a
+        // request whose first prefill already settled it.
+        self.settle_connector_lookup(request_id, 0);
         self.saved_cursor.remove(&request_id);
         if self.speculative.is_some() {
             self.dflash_ready_requests.remove(&request_id);
