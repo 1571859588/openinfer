@@ -124,7 +124,7 @@ fn assert_close(cold: &[(u32, f32)], warm: &[(u32, f32)]) {
     );
 }
 
-/// One executor, three scenarios, run sequentially. cargo runs `#[test]`
+/// One executor, four scenarios, run sequentially. cargo runs `#[test]`
 /// functions on parallel threads; two Qwen3-4B executors sharing device 0 and
 /// the same pegaflow instance id ("qwen3-dev0") would collide on the host
 /// tier. Production wires exactly one executor per model, so the realistic
@@ -151,6 +151,7 @@ fn live_gpu_and_cpu_prefix_hits() {
     cpu_tier_restores_evicted_prefix(&mut ex);
     gpu_and_cpu_combined_hit(&mut ex);
     connector_miss_is_counted(&mut ex);
+    local_growth_after_a_partial_load_stays_local(&mut ex);
 }
 
 /// A prefix that is evicted from HBM and restored entirely from the CPU tier
@@ -362,4 +363,66 @@ fn gpu_and_cpu_combined_hit(ex: &mut Qwen3Executor) {
     ex.drop_request(RequestId::new(3)).expect("drop req3");
 
     assert_close(&cold_first, &warm_first);
+}
+
+/// The connector restores only part of the prompt, and while the request is
+/// parked on that load another request computes the whole prompt locally.
+/// The admission-time match then spans the loaded blocks and the sibling's
+/// longer prefix; only the loaded blocks crossed the connector, so only they
+/// are external hits.
+fn local_growth_after_a_partial_load_stays_local(ex: &mut Qwen3Executor) {
+    let full = prompt(13, 100); // 6 full blocks (96 tok) + 4-token tail
+    let short = full[..50].to_vec(); // 3-block prefix of `full`
+
+    // ── Only `short`'s 3 blocks reach the host tier; HBM keeps none. ──
+    ex.execute_prefill(PrefillPlan {
+        sample_seed: 0,
+        requests: &[prefill_item(1, &short)],
+    })
+    .expect("cold short prefill");
+    ex.drop_request(RequestId::new(1)).expect("drop req1");
+    ex.flush_offload_saves();
+    ex.evict_cached_blocks();
+
+    // ── Request 2 asks the connector about all of `full` (nothing local) and
+    // loads the 3 blocks it has. ──
+    let id = RequestId::new(2);
+    assert!(
+        ex.begin_kv_prefetch(id, &full, None, 0),
+        "the host tier holds the first 3 blocks"
+    );
+    let ready = ex.wait_ready_prefetch(0);
+    assert!(ready.contains(&id), "prefetch must settle, got {ready:?}");
+
+    // ── While request 2 is parked, request 3 computes `full` and registers
+    // blocks 3..6 locally. ──
+    ex.execute_prefill(PrefillPlan {
+        sample_seed: 0,
+        requests: &[prefill_item(3, &full)],
+    })
+    .expect("sibling full prefill");
+    ex.drop_request(RequestId::new(3)).expect("drop req3");
+
+    let admitted = ex
+        .execute_prefill(PrefillPlan {
+            sample_seed: 0,
+            requests: &[prefill_item(2, &full)],
+        })
+        .expect("admitted full prefill");
+    assert_eq!(
+        admitted.requests[0].cached_tokens,
+        Some(6 * BLOCK),
+        "3 loaded blocks + the sibling's 3 local blocks match as one prefix"
+    );
+    assert_eq!(
+        admitted.requests[0].external_hit_tokens,
+        Some(3 * BLOCK),
+        "only the loaded blocks are external; the sibling's growth is local"
+    );
+    assert_eq!(
+        admitted.requests[0].external_query_tokens,
+        Some(full.len()),
+        "the connector was asked about the whole prompt"
+    );
+    ex.drop_request(id).expect("drop req2");
 }

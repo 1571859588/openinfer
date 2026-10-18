@@ -1844,18 +1844,22 @@ impl Qwen3Executor {
             if self.prefix_cache_enabled() && req.prompt_logprobs.is_none() {
                 let matched = rkv.match_and_add_prefix(self.kv_mgr.pool())?;
                 req.cached_tokens = Some(matched);
-                // What the connector restored is not a local hit. The probe
-                // reports how many of the matched blocks already sat in local
-                // GPU KV; a request whose probe is already gone (a scratch
-                // prefill, a released lease) restored nothing, so its whole
-                // match is local. `None` means no connector was consulted at
-                // all, so there is no external leg to report.
+                // What the connector restored is not a local hit. Only the
+                // blocks a load committed onto the probe (held past its GPU
+                // hit) crossed the connector; anything else in the match was
+                // local, including blocks another request registered while
+                // this one was parked. A request whose probe is already gone
+                // (a scratch prefill, a released lease) restored nothing.
+                // `None` means no connector was consulted at all, so there is
+                // no external leg to report.
                 if let Some(&queried) = self.connector_consulted.get(&req.request_id) {
                     let block_size = self.metadata.block_size;
-                    let local = self.prefetch.get(&req.request_id).map_or(matched, |state| {
-                        (state.probe.gpu_hit_blocks() * block_size).min(matched)
+                    let external = self.prefetch.get(&req.request_id).map_or(0, |state| {
+                        let gpu_hit = state.probe.gpu_hit_blocks();
+                        let loaded = state.probe.held_blocks() - gpu_hit;
+                        (loaded * block_size).min(matched.saturating_sub(gpu_hit * block_size))
                     });
-                    req.external_hit_tokens = Some(matched.saturating_sub(local));
+                    req.external_hit_tokens = Some(external);
                     req.external_query_tokens = Some(queried);
                 }
             }
