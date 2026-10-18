@@ -220,6 +220,11 @@ fn cpu_tier_restores_evicted_prefix(ex: &mut Qwen3Executor) {
 /// external counters can only separate "asked and missed" from "never asked"
 /// by recording the consultation itself. Without that record every miss
 /// disappears from the counters and the external hit rate reads 100%.
+///
+/// The missed request then stays deferred while another request registers
+/// the same prefix in local KV. Its external query width must still be the
+/// query that was sent (the whole prompt), not one re-derived from the
+/// larger admission-time match.
 fn connector_miss_is_counted(ex: &mut Qwen3Executor) {
     let unseen = prompt(11, 50); // disjoint seed: never saved to the host tier
     let id = RequestId::new(3);
@@ -233,6 +238,18 @@ fn connector_miss_is_counted(ex: &mut Qwen3Executor) {
         "a miss leaves no load to settle"
     );
 
+    // While request 3 waits, request 4 computes the same prompt and leaves
+    // its 3 full blocks in the local prefix cache. It never asked the
+    // connector.
+    let sibling = ex
+        .execute_prefill(PrefillPlan {
+            sample_seed: 0,
+            requests: &[prefill_item(4, &unseen)],
+        })
+        .expect("sibling prefill");
+    assert_eq!(sibling.requests[0].external_hit_tokens, None);
+    ex.drop_request(RequestId::new(4)).expect("drop req4");
+
     let missed = ex
         .execute_prefill(PrefillPlan {
             sample_seed: 0,
@@ -241,8 +258,8 @@ fn connector_miss_is_counted(ex: &mut Qwen3Executor) {
         .expect("miss prefill");
     assert_eq!(
         missed.requests[0].cached_tokens,
-        Some(0),
-        "unseen prefix: the lookup ran and missed"
+        Some(3 * BLOCK),
+        "the sibling's blocks are matched locally at admission"
     );
     // The point of this case: `Some(0)`, not `None`. `None` would mean the
     // connector was never consulted, which is what dropped every miss from the
@@ -252,6 +269,12 @@ fn connector_miss_is_counted(ex: &mut Qwen3Executor) {
         Some(0),
         "the connector was queried and restored nothing; a miss must be \
          counted, not dropped as 'never asked'"
+    );
+    assert_eq!(
+        missed.requests[0].external_query_tokens,
+        Some(unseen.len()),
+        "the connector was asked about the whole prompt, before the sibling \
+         made part of it local"
     );
     ex.drop_request(id).expect("drop req3");
 }
@@ -329,6 +352,11 @@ fn gpu_and_cpu_combined_hit(ex: &mut Qwen3Executor) {
         warm.requests[0].external_hit_tokens,
         Some(3 * BLOCK),
         "the GPU-resident half is local, the restored half is external"
+    );
+    assert_eq!(
+        warm.requests[0].external_query_tokens,
+        Some(full.len() - 3 * BLOCK),
+        "the connector was asked about everything past the GPU-resident half"
     );
     let warm_first = first_token_top(&warm);
     ex.drop_request(RequestId::new(3)).expect("drop req3");

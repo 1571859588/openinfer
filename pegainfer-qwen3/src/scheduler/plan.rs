@@ -292,6 +292,7 @@ fn build_prefill_items(pending: &[PendingRequest], indices: &[usize]) -> Vec<Pre
                 // in (`None` stays `None` when it never runs one).
                 cached_tokens: None,
                 external_hit_tokens: None,
+                external_query_tokens: None,
                 chunk_budget: r.step_chunk,
                 chunk_start: 0,
                 chunk_tokens: 0,

@@ -102,6 +102,10 @@ pub struct PrefillStepItem {
     /// consulted and restored nothing. The external `/metrics` family is
     /// driven by this distinction, not by `cached_tokens`.
     pub(crate) external_hit_tokens: Option<usize>,
+    /// Prompt tokens the connector was asked about: the prompt minus what
+    /// sat in local KV when the query was issued. Set exactly when
+    /// `external_hit_tokens` is; it is the external family's denominator.
+    pub(crate) external_query_tokens: Option<usize>,
     /// Scheduler-set cap on prompt tokens forwarded this step (chunked
     /// prefill). The executor clamps it to the tokens actually remaining.
     pub(crate) chunk_budget: usize,
@@ -133,6 +137,7 @@ impl PrefillStepItem {
             lora_adapter: None,
             cached_tokens: None,
             external_hit_tokens: None,
+            external_query_tokens: None,
             chunk_budget: usize::MAX,
             chunk_start: 0,
             chunk_tokens,
@@ -723,6 +728,10 @@ pub struct PrefillRequestResult {
     /// connector was consulted for this request; `Some(0)` when it was
     /// consulted and restored nothing.
     pub external_hit_tokens: Option<usize>,
+    /// Prompt tokens the connector was asked about, fixed when the query was
+    /// issued (the prompt minus the local KV hit at that moment). Set exactly
+    /// when `external_hit_tokens` is.
+    pub external_query_tokens: Option<usize>,
     /// Whether the prompt is fully prefilled. When false this step ran a
     /// non-final chunk and `first_token` is meaningless.
     pub completed: bool,
@@ -930,12 +939,17 @@ pub struct Qwen3Executor {
     /// settles and the blocks register into the prefix cache.
     prefetch: HashMap<RequestId, PrefetchState>,
     /// Requests whose connector was actually queried, whether it answered with
-    /// a hit or a miss. The prefetch state above is dropped on every
-    /// non-carrying outcome (a scratch prefill, a released lease, a failed
-    /// load), so its absence cannot be read as "never asked". This marker is
-    /// what keeps a connector miss in the external counters, instead of
-    /// reporting only successful restores and inflating the external hit rate.
-    connector_consulted: HashSet<RequestId>,
+    /// a hit or a miss, mapped to the prompt tokens that query covered (the
+    /// prompt minus the probe's local GPU hit at query time). The prefetch
+    /// state above is dropped on every non-carrying outcome (a scratch
+    /// prefill, a released lease, a failed load), so its absence cannot be
+    /// read as "never asked". This marker is what keeps a connector miss in
+    /// the external counters, instead of reporting only successful restores
+    /// and inflating the external hit rate. The width is kept here rather
+    /// than re-derived at admission: a request is offered to the connector
+    /// once and may stay deferred while the local cache grows, so the
+    /// admission-time match no longer describes the query that was sent.
+    connector_consulted: HashMap<RequestId, usize>,
     /// Offload pure-L2 mode. When set, completed blocks are not kept for
     /// cross-request HBM reuse: the prefetch probe drains the inactive pool
     /// first, so every probe sees `gpu_hit == 0` and the whole cacheable prefix
@@ -1163,7 +1177,7 @@ impl Qwen3Executor {
             offload,
             saved_cursor: HashMap::new(),
             prefetch: HashMap::new(),
-            connector_consulted: HashSet::new(),
+            connector_consulted: HashMap::new(),
             l1_retention_disabled: false,
             // Derived here, not via a post-construction setter, so every
             // launch path (plain and LoRA alike) honors the P/D contract.
@@ -1571,7 +1585,7 @@ impl Qwen3Executor {
             offload: None,
             saved_cursor: HashMap::new(),
             prefetch: HashMap::new(),
-            connector_consulted: HashSet::new(),
+            connector_consulted: HashMap::new(),
             l1_retention_disabled: false,
             flush_offload_on_finish: false,
             vllm_compat: None,
@@ -1848,14 +1862,14 @@ impl Qwen3Executor {
                 // prefill, a released lease) restored nothing, so its whole
                 // match is local. `None` means no connector was consulted at
                 // all, so there is no external leg to report.
-                req.external_hit_tokens =
-                    self.connector_consulted.contains(&req.request_id).then(|| {
-                        let block_size = self.metadata.block_size;
-                        let local = self.prefetch.get(&req.request_id).map_or(matched, |state| {
-                            (state.probe.gpu_hit_blocks() * block_size).min(matched)
-                        });
-                        matched.saturating_sub(local)
+                if let Some(&queried) = self.connector_consulted.get(&req.request_id) {
+                    let block_size = self.metadata.block_size;
+                    let local = self.prefetch.get(&req.request_id).map_or(matched, |state| {
+                        (state.probe.gpu_hit_blocks() * block_size).min(matched)
                     });
+                    req.external_hit_tokens = Some(matched.saturating_sub(local));
+                    req.external_query_tokens = Some(queried);
+                }
             }
             self.request_kvs.insert(req.request_id, rkv);
             // match_and_add_prefix above already absorbed any CPU-prefetched
@@ -2491,7 +2505,11 @@ impl ModelExecutor for Qwen3Executor {
         // that before the call: a miss, an error, or a released lease must
         // still report an external lookup, and only the early returns above
         // stay uncounted.
-        self.connector_consulted.insert(request_id);
+        let local_at_query = probe.gpu_hit_blocks() * self.metadata.block_size;
+        self.connector_consulted.insert(
+            request_id,
+            prompt_tokens.len().saturating_sub(local_at_query),
+        );
         let action = remote_fetch_action(
             false,
             expect_remote,
