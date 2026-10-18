@@ -212,26 +212,10 @@ impl SteppedEngineBridge {
         run_result
     }
 
-<<<<<<< HEAD
     /// Stats for an outgoing batch; the counter deltas run from the last
     /// batch stamped, not the last step run.
     fn stats(&self, tracker: &mut StatsTracker) -> SchedulerStats {
         tracker.stats(&self.scheduler.metrics())
-=======
-    /// Stats for an outgoing batch; the spec delta runs from the last batch
-    /// stamped, not the last step run.
-    fn stats(
-        &self,
-        prefix: &mut PrefixCacheTracker,
-        spec: &mut SpecDecodeTracker,
-    ) -> SchedulerStats {
-        let snapshot = self.scheduler.metrics();
-        let mut stats = scheduler_stats_from(&snapshot);
-        stats.prefix_cache_stats.base = prefix.interval(&snapshot);
-        stats.connector_prefix_cache_stats = prefix.external_interval(&snapshot);
-        stats.spec_decoding_stats = spec.interval(&snapshot);
-        stats
->>>>>>> 6c3961a1 (feat(observability): attribute externally restored prefix hits separately)
     }
 
     fn dispatch_step(

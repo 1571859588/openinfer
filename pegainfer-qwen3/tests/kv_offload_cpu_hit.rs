@@ -23,6 +23,7 @@ use std::path::Path;
 use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_qwen3::Qwen3LoraOptions;
 use pegainfer_qwen3::Qwen3OffloadOptions;
+use pegainfer_qwen3::runtime::ConnectorLookupCounters;
 use pegainfer_qwen3::runtime::PrefillPlan;
 use pegainfer_qwen3::runtime::PrefillStepItem;
 use pegainfer_qwen3::runtime::Qwen3Executor;
@@ -78,6 +79,12 @@ fn prefill_item(id: u64, prompt: &[u32]) -> PrefillStepItem {
     )
 }
 
+/// The connector lookups settled since `before`, as `(queries, hits)` tokens.
+fn lookups_since(ex: &Qwen3Executor, before: ConnectorLookupCounters) -> (u64, u64) {
+    let now = ex.connector_lookup_counters();
+    (now.queries - before.queries, now.hits - before.hits)
+}
+
 fn first_token_top(pr: &pegainfer_qwen3::runtime::PrefillResult) -> Vec<(u32, f32)> {
     pr.requests[0]
         .first_token_logprob
@@ -124,7 +131,7 @@ fn assert_close(cold: &[(u32, f32)], warm: &[(u32, f32)]) {
     );
 }
 
-/// One executor, four scenarios, run sequentially. cargo runs `#[test]`
+/// One executor, five scenarios, run sequentially. cargo runs `#[test]`
 /// functions on parallel threads; two Qwen3-4B executors sharing device 0 and
 /// the same pegaflow instance id ("qwen3-dev0") would collide on the host
 /// tier. Production wires exactly one executor per model, so the realistic
@@ -152,6 +159,7 @@ fn live_gpu_and_cpu_prefix_hits() {
     gpu_and_cpu_combined_hit(&mut ex);
     connector_miss_is_counted(&mut ex);
     local_growth_after_a_partial_load_stays_local(&mut ex);
+    cancelled_after_load_still_counts_its_lookup(&mut ex);
 }
 
 /// A prefix that is evicted from HBM and restored entirely from the CPU tier
@@ -229,6 +237,7 @@ fn cpu_tier_restores_evicted_prefix(ex: &mut Qwen3Executor) {
 fn connector_miss_is_counted(ex: &mut Qwen3Executor) {
     let unseen = prompt(11, 50); // disjoint seed: never saved to the host tier
     let id = RequestId::new(3);
+    let before = ex.connector_lookup_counters();
 
     assert!(
         !ex.begin_kv_prefetch(id, &unseen, None, 0),
@@ -272,10 +281,10 @@ fn connector_miss_is_counted(ex: &mut Qwen3Executor) {
          counted, not dropped as 'never asked'"
     );
     assert_eq!(
-        missed.requests[0].external_query_tokens,
-        Some(unseen.len()),
+        lookups_since(ex, before),
+        (unseen.len() as u64, 0),
         "the connector was asked about the whole prompt, before the sibling \
-         made part of it local"
+         made part of it local; the sibling never asked"
     );
     ex.drop_request(id).expect("drop req3");
 }
@@ -323,6 +332,7 @@ fn gpu_and_cpu_combined_hit(ex: &mut Qwen3Executor) {
 
     // ── Prefetch `full`: GPU hits blocks 0..3, the host tier must supply the
     // continuation 3..6. A pure GPU hit would not start a load. ──
+    let before = ex.connector_lookup_counters();
     let hit = ex.begin_kv_prefetch(RequestId::new(3), &full, None, 0);
     assert!(
         hit,
@@ -355,9 +365,10 @@ fn gpu_and_cpu_combined_hit(ex: &mut Qwen3Executor) {
         "the GPU-resident half is local, the restored half is external"
     );
     assert_eq!(
-        warm.requests[0].external_query_tokens,
-        Some(full.len() - 3 * BLOCK),
-        "the connector was asked about everything past the GPU-resident half"
+        lookups_since(ex, before),
+        ((full.len() - 3 * BLOCK) as u64, (3 * BLOCK) as u64),
+        "the connector was asked about everything past the GPU-resident half \
+         and restored the second half"
     );
     let warm_first = first_token_top(&warm);
     ex.drop_request(RequestId::new(3)).expect("drop req3");
@@ -387,6 +398,7 @@ fn local_growth_after_a_partial_load_stays_local(ex: &mut Qwen3Executor) {
     // ── Request 2 asks the connector about all of `full` (nothing local) and
     // loads the 3 blocks it has. ──
     let id = RequestId::new(2);
+    let before = ex.connector_lookup_counters();
     assert!(
         ex.begin_kv_prefetch(id, &full, None, 0),
         "the host tier holds the first 3 blocks"
@@ -420,9 +432,54 @@ fn local_growth_after_a_partial_load_stays_local(ex: &mut Qwen3Executor) {
         "only the loaded blocks are external; the sibling's growth is local"
     );
     assert_eq!(
-        admitted.requests[0].external_query_tokens,
-        Some(full.len()),
-        "the connector was asked about the whole prompt"
+        lookups_since(ex, before),
+        (full.len() as u64, (3 * BLOCK) as u64),
+        "the connector was asked about the whole prompt and restored 3 blocks"
     );
     ex.drop_request(id).expect("drop req2");
+}
+
+/// A request whose load settled and which is then cancelled before its first
+/// prefill (the scheduler's abort and reject paths both end in
+/// `drop_request`) still asked the connector. Its lookup must reach the
+/// counters as a query with no hits, exactly once.
+fn cancelled_after_load_still_counts_its_lookup(ex: &mut Qwen3Executor) {
+    let p = prompt(17, 50); // 3 full blocks (48 tok) + 2-token tail
+
+    ex.execute_prefill(PrefillPlan {
+        sample_seed: 0,
+        requests: &[prefill_item(1, &p)],
+    })
+    .expect("cold prefill");
+    ex.drop_request(RequestId::new(1)).expect("drop req1");
+    ex.flush_offload_saves();
+    ex.evict_cached_blocks();
+
+    let id = RequestId::new(2);
+    let before = ex.connector_lookup_counters();
+    assert!(
+        ex.begin_kv_prefetch(id, &p, None, 0),
+        "P must hit the CPU tier after GPU eviction"
+    );
+    let ready = ex.wait_ready_prefetch(0);
+    assert!(ready.contains(&id), "prefetch must settle, got {ready:?}");
+    assert_eq!(
+        lookups_since(ex, before),
+        (0, 0),
+        "a lookup is settled when the request leaves, not when it is sent"
+    );
+
+    // Cancelled while parked: no prefill ever runs for it.
+    ex.drop_request(id).expect("drop req2");
+    assert_eq!(
+        lookups_since(ex, before),
+        (p.len() as u64, 0),
+        "a cancelled request still reports the query it sent, with no hits"
+    );
+    ex.drop_request(id).expect("drop req2 again");
+    assert_eq!(
+        lookups_since(ex, before),
+        (p.len() as u64, 0),
+        "a lookup is settled once"
+    );
 }

@@ -102,20 +102,21 @@ fn top_logprobs(lp: Option<&TokenLogprob>) -> Vec<(u32, f32)> {
 }
 
 /// Prefill `prompt`, teacher-force `DECODE_FED`, drop the request. Returns
-/// the cached-token count and the top-K logprobs at every position.
-fn run_one(ex: &mut Qwen3Executor, id: u64, prompt: &[u32]) -> (usize, Vec<Vec<(u32, f32)>>) {
+/// the executor's cached-token report and the top-K logprobs at every
+/// position. The report is `None` when no lookup ran (cache switched off) and
+/// `Some(0)` for a genuine miss, so callers assert on both.
+fn run_one(
+    ex: &mut Qwen3Executor,
+    id: u64,
+    prompt: &[u32],
+) -> (Option<usize>, Vec<Vec<(u32, f32)>>) {
     let pr = ex
         .execute_prefill(PrefillPlan {
             sample_seed: 0,
             requests: &[prefill_item(id, prompt)],
         })
         .expect("prefill");
-    // The real executor always consults the prefix cache, so a lookup is
-    // always reported; `None` would mean the gate swallowed it. `Some(0)` is a
-    // genuine miss, which the caller asserts on.
-    let cached = pr.requests[0]
-        .cached_tokens
-        .expect("the real executor always runs a prefix-cache lookup");
+    let cached = pr.requests[0].cached_tokens;
     let mut positions = vec![top_logprobs(pr.requests[0].first_token_logprob.as_ref())];
     for fed in DECODE_FED {
         let dr = ex
@@ -191,10 +192,7 @@ fn prefix_cache_behavior() {
     // the cache later must start cold rather than resurrecting these blocks.
     ex.set_prefix_cache_enabled(false);
     let (cached, a_cold) = run_one(&mut ex, 1, &a);
-    assert_eq!(
-        cached, 0,
-        "matching disabled must report zero cached tokens"
-    );
+    assert_eq!(cached, None, "matching disabled must run no lookup");
     let (_, b_cold) = run_one(&mut ex, 2, &b);
     let (_, c_cold) = run_one(&mut ex, 3, &c);
 
@@ -203,7 +201,8 @@ fn prefix_cache_behavior() {
     ex.set_prefix_cache_enabled(true);
     let (cached, _) = run_one(&mut ex, 4, &a);
     assert_eq!(
-        cached, 0,
+        cached,
+        Some(0),
         "cache-disabled requests must not seed a later enabled cache"
     );
     let _ = run_one(&mut ex, 5, &b);
@@ -212,19 +211,23 @@ fn prefix_cache_behavior() {
     let (cached, a_warm) = run_one(&mut ex, 11, &a);
     assert_eq!(
         cached,
-        3 * BLOCK,
+        Some(3 * BLOCK),
         "A: 3 full blocks hit, 2-token tail recomputed"
     );
     assert_close("A warm", &a_cold, &a_warm);
 
     let (cached, b_warm) = run_one(&mut ex, 12, &b);
-    assert_eq!(cached, 4 * BLOCK, "B: A's 3 blocks + B's own 4th block hit");
+    assert_eq!(
+        cached,
+        Some(4 * BLOCK),
+        "B: A's 3 blocks + B's own 4th block hit"
+    );
     assert_close("B warm (extension)", &b_cold, &b_warm);
 
     let (cached, c_warm) = run_one(&mut ex, 13, &c);
     assert_eq!(
         cached,
-        3 * BLOCK,
+        Some(3 * BLOCK),
         "C: all 4 blocks are cached but the cap must keep one block of prefill"
     );
     assert_close("C warm (full-block cap)", &c_cold, &c_warm);
@@ -269,7 +272,8 @@ fn prefix_cache_behavior() {
     // again so the unified-path assertions below exercise warm page reuse.
     let (cached, _) = run_one(&mut ex, 32, &b);
     assert_eq!(
-        cached, 0,
+        cached,
+        Some(0),
         "re-enabled cache starts cold after transition drain"
     );
 

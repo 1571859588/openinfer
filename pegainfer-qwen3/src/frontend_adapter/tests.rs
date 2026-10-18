@@ -618,10 +618,12 @@ fn arrivals_during_inflight_prefill_leave_its_kv_tail() {
     );
 }
 
-/// E2E (no GPU) for the prefix-cache `/metrics` counters: drive a real
+/// Scheduler counter test (no GPU) for the prefix-cache totals: drive a real
 /// `Qwen3Scheduler` through the engine contract with a fake executor that
-/// reports a cached prefix on every request's first chunk, then scrape
-/// `SchedulerMetrics` across multiple batches and scrapes.
+/// reports a cached prefix on every request's first chunk, then read the
+/// in-memory `SchedulerMetrics` snapshot across multiple batches. It does not
+/// go through the bridge or HTTP; the vLLM sim tests cover the `/metrics`
+/// path.
 ///
 /// Guards against the two bugs from review:
 ///  * unit mismatch — `prefix_queries`/`prefix_hits` are both TOKEN-granular
@@ -666,12 +668,14 @@ fn prefix_cache_metrics_stable_across_batches_and_scrapes() {
             wait_until(Duration::from_secs(2), || partition
                 .handle
                 .metrics()
-                .prefix_cache_queries
+                .prefix_cache
+                .map_or(0, |c| c.queries)
                 >= target),
             "batch {batch} prefix queries never reached {target}"
         );
         let m = partition.handle.metrics();
-        scrapes.push((batch, m.prefix_cache_queries, m.prefix_cache_hits));
+        let pc = m.prefix_cache.unwrap_or_default();
+        scrapes.push((batch, pc.queries, pc.hits - pc.host_hits));
     }
 
     // Drain the step stream so the driver thread can exit cleanly.
@@ -680,21 +684,23 @@ fn prefix_cache_metrics_stable_across_batches_and_scrapes() {
     }
 
     let a = partition.handle.metrics();
+    let apc = a.prefix_cache.unwrap_or_default();
 
     // Token-granular correctness per vLLM PrefixCacheStats: every request
     // queries PROMPT_TOKENS and hits HIT_TOKENS, so the running totals are
     // TOTAL * those, and hit_rate = HIT_TOKENS / PROMPT_TOKENS in [0, 1].
     let expected_q = TOTAL * PROMPT_TOKENS;
     // Hits are the local share only — what the connector restored is carried
-    // by the external family instead.
-    let expected_h = TOTAL * (HIT_TOKENS - EXTERNAL_HIT_TOKENS);
-    assert_eq!(a.prefix_cache_queries, expected_q);
-    assert_eq!(a.prefix_cache_hits, expected_h);
+    // by the external family (host_hits) instead.
+    let expected_local_h = TOTAL * (HIT_TOKENS - EXTERNAL_HIT_TOKENS);
+    assert_eq!(apc.queries, expected_q);
+    let local_hits = apc.hits - apc.host_hits;
+    assert_eq!(local_hits, expected_local_h);
     assert!(
-        a.prefix_cache_hits <= a.prefix_cache_queries,
+        apc.hits <= apc.queries,
         "hits (cached tokens) must not exceed queries (queried tokens)"
     );
-    let hit_rate = a.prefix_cache_hits as f64 / a.prefix_cache_queries as f64;
+    let hit_rate = local_hits as f64 / apc.queries as f64;
     assert!(
         (hit_rate - (HIT_TOKENS - EXTERNAL_HIT_TOKENS) as f64 / PROMPT_TOKENS as f64).abs() < 1e-9
     );
@@ -702,10 +708,10 @@ fn prefix_cache_metrics_stable_across_batches_and_scrapes() {
     // The external family: asked about whatever the local cache did not
     // answer, and it restored EXTERNAL_HIT_TOKENS of it.
     assert_eq!(
-        a.prefix_cache_external_queries,
+        apc.host_queries,
         TOTAL * (PROMPT_TOKENS - (HIT_TOKENS - EXTERNAL_HIT_TOKENS))
     );
-    assert_eq!(a.prefix_cache_external_hits, TOTAL * EXTERNAL_HIT_TOKENS);
+    assert_eq!(apc.host_hits, TOTAL * EXTERNAL_HIT_TOKENS);
 
     // Each batch contributed a stable, non-zero delta of exactly
     // PER_BATCH * PROMPT_TOKENS (queries) and PER_BATCH * the LOCAL hits:
@@ -755,13 +761,14 @@ fn prefix_cache_disabled_reports_no_lookups() {
     }
 
     let m = partition.handle.metrics();
+    let mpc = m.prefix_cache.unwrap_or_default();
     eprintln!(
         "[scrape] cache disabled: prefix_cache_queries={} prefix_cache_hits={}",
-        m.prefix_cache_queries, m.prefix_cache_hits
+        mpc.queries, mpc.hits
     );
     assert_eq!(
-        m.prefix_cache_queries, 0,
+        mpc.queries, 0,
         "a disabled prefix cache must not report queries it never performed"
     );
-    assert_eq!(m.prefix_cache_hits, 0, "a disabled prefix cache cannot hit");
+    assert_eq!(mpc.hits, 0, "a disabled prefix cache cannot hit");
 }
