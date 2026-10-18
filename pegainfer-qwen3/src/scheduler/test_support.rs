@@ -65,14 +65,12 @@ pub(crate) struct FakeExecutor {
     emit_logprobs: bool,
     async_prefill: Option<Arc<AsyncPrefillGate>>,
     parked_prefill: Option<PrefillResult>,
-    // When > 0, the first prefill chunk of every request reports this many
-    // `cached_tokens` (a simulated prefix-cache hit). Drives the prefix-cache
-    // query/hit counters without a real GPU KV cache.
-    prefix_hit_tokens: usize,
-    // Whether the fake executor claims to consult a prefix cache at all.
-    // `false` models a real executor with prefix caching switched off, which
-    // never calls `match_and_add_prefix` and must therefore report no queries.
-    prefix_cache_enabled: bool,
+    // `cached_tokens` the first prefill chunk of every request reports (a
+    // simulated prefix-cache lookup). Drives the prefix-cache query/hit
+    // counters without a real GPU KV cache. `None` models a real executor with
+    // prefix caching switched off, which never calls `match_and_add_prefix`
+    // and must therefore report no queries.
+    prefix_hit_tokens: Option<usize>,
     // Tokens of the simulated hit attributed to the external side (CPU offload
     // / P2P) rather than found in local KV. `None` models an engine that
     // consulted no connector for this request, so the external family stays
@@ -100,8 +98,7 @@ impl FakeExecutor {
             emit_logprobs: false,
             async_prefill: None,
             parked_prefill: None,
-            prefix_hit_tokens: 0,
-            prefix_cache_enabled: true,
+            prefix_hit_tokens: Some(0),
             prefix_external_hit_tokens: None,
         }
     }
@@ -119,14 +116,14 @@ impl FakeExecutor {
     /// Simulate a prefix-cache hit on every request's first prefill chunk by
     /// reporting `tokens` cached tokens.
     pub(crate) fn with_prefix_hit(mut self, tokens: usize) -> Self {
-        self.prefix_hit_tokens = tokens;
+        self.prefix_hit_tokens = Some(tokens);
         self
     }
 
     /// Model an executor that never consults a prefix cache (caching switched
     /// off): no `match_and_add_prefix` happens, so no query may be counted.
     pub(crate) fn without_prefix_cache(mut self) -> Self {
-        self.prefix_cache_enabled = false;
+        self.prefix_hit_tokens = None;
         self
     }
 
@@ -201,11 +198,14 @@ impl FakeExecutor {
             // (start == 0); later chunks carry no cached prefix. `None` models
             // a cache that never ran a lookup (switched off, or prompt
             // scoring).
-            cached_tokens: (start == 0 && self.prefix_cache_enabled)
-                .then_some(self.prefix_hit_tokens),
+            cached_tokens: if start == 0 {
+                self.prefix_hit_tokens
+            } else {
+                None
+            },
             // The external family is only reported for a request whose
             // connector was consulted; later chunks contribute nothing.
-            external_hit_tokens: if start == 0 && self.prefix_cache_enabled {
+            external_hit_tokens: if start == 0 && self.prefix_hit_tokens.is_some() {
                 self.prefix_external_hit_tokens
             } else {
                 None
