@@ -231,6 +231,8 @@ pub use norm::rms_norm_rows_into;
 #[cfg(feature = "qwen35")]
 pub use qwen35::paged_attention_batch_decode_hd256_into;
 #[cfg(feature = "qwen35")]
+pub use qwen35::paged_attention_batch_decode_split_hd256_into;
+#[cfg(feature = "qwen35")]
 pub use qwen35::paged_attention_batch_decode_via_prefill_hd256_into;
 #[cfg(feature = "qwen35")]
 pub use qwen35::qk_norm_partial_rope_batched_decode_hd256_into;

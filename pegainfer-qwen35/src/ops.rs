@@ -17,6 +17,7 @@ pub use pegainfer_core::ops::rms_norm_offset_into;
 pub(crate) use pegainfer_core::ops::silu_mul_fused_batch_into;
 pub(crate) use pegainfer_core::ops::write_vec_into;
 pub(crate) use pegainfer_kernels::ops::paged_attention_batch_decode_hd256_into;
+pub(crate) use pegainfer_kernels::ops::paged_attention_batch_decode_split_hd256_into;
 pub(crate) use pegainfer_kernels::ops::paged_attention_batch_decode_via_prefill_hd256_into;
 pub(crate) use pegainfer_kernels::ops::qk_norm_partial_rope_batched_decode_hd256_into;
 pub(crate) use recurrent::conv1d_decode_batch_into;
