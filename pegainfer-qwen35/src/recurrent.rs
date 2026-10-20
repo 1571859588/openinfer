@@ -2,14 +2,10 @@ use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use cudarc::driver::DevicePtr;
 use cudarc::driver::DevicePtrMut;
-use pegainfer_core::tensor::Columns;
 use pegainfer_core::tensor::DeviceContext;
 use pegainfer_core::tensor::DeviceVec;
 use pegainfer_core::tensor::HiddenStates;
 
-use crate::config::GDN_AOT_KEY_HEAD_DIM;
-use crate::config::GDN_AOT_VALUE_HEAD_DIM;
-use crate::config::LINEAR_CONV_MAX_KERNEL_DIM;
 use crate::ffi;
 use crate::prefill_buffers::GdrChunkwiseScratch35;
 
@@ -50,112 +46,6 @@ pub(crate) fn gated_delta_rule_decode_vec_into(
             num_value_heads as i32,
             key_dim as i32,
             val_dim as i32,
-            ctx.stream.cu_stream(),
-        );
-    }
-}
-
-/// `b_proj` and `a_proj` may each be one band of a fused beta/alpha projection;
-/// their slot stride is then the tensor they are a band of.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn gated_delta_rule_decode_batch_into<'a>(
-    ctx: &DeviceContext,
-    qkv: &HiddenStates,
-    b_proj: impl Into<Columns<'a>>,
-    a_proj: impl Into<Columns<'a>>,
-    dt_bias: &DeviceVec,
-    a_log: &CudaSlice<f32>,
-    state_ptrs: &CudaSlice<u64>,
-    output: &mut HiddenStates,
-    batch_size: usize,
-    num_key_heads: usize,
-    num_value_heads: usize,
-    key_dim: usize,
-    val_dim: usize,
-) {
-    let b_proj = b_proj.into();
-    let a_proj = a_proj.into();
-    b_proj.assert_in_row("gated_delta_rule_decode b_proj");
-    a_proj.assert_in_row("gated_delta_rule_decode a_proj");
-    assert_eq!(qkv.seq_len, batch_size);
-    assert_eq!(b_proj.states.seq_len, batch_size);
-    assert_eq!(a_proj.states.seq_len, batch_size);
-    assert_eq!(output.seq_len, batch_size);
-    assert_eq!(b_proj.width, num_value_heads);
-    assert_eq!(a_proj.width, num_value_heads);
-    assert_eq!(output.hidden_dim, num_value_heads * val_dim);
-    assert_eq!(key_dim, GDN_AOT_KEY_HEAD_DIM);
-    assert_eq!(val_dim, GDN_AOT_VALUE_HEAD_DIM);
-    assert!(state_ptrs.len() >= batch_size);
-
-    let (b_base, _gb) = b_proj.states.data.device_ptr(&ctx.stream);
-    let b_ptr = b_base + (b_proj.col * std::mem::size_of::<half::bf16>()) as u64;
-    let (a_base, _ga) = a_proj.states.data.device_ptr(&ctx.stream);
-    let a_ptr = a_base + (a_proj.col * std::mem::size_of::<half::bf16>()) as u64;
-    let (qkv_ptr, _gq) = qkv.data.device_ptr(&ctx.stream);
-    let (dt_ptr, _gdt) = dt_bias.data.device_ptr(&ctx.stream);
-    let (alog_ptr, _gal) = a_log.device_ptr(&ctx.stream);
-    let (state_ptrs, _gsp) = state_ptrs.device_ptr(&ctx.stream);
-    let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
-
-    unsafe {
-        ffi::gated_delta_rule_decode_batch_cuda(
-            qkv_ptr as *const ffi::Half,
-            b_ptr as *const ffi::Half,
-            a_ptr as *const ffi::Half,
-            dt_ptr as *const ffi::Half,
-            alog_ptr as *const f32,
-            state_ptrs as *const u64,
-            o_ptr as *mut ffi::Half,
-            batch_size as i32,
-            num_key_heads as i32,
-            num_value_heads as i32,
-            key_dim as i32,
-            val_dim as i32,
-            b_proj.states.hidden_dim as i32,
-            a_proj.states.hidden_dim as i32,
-            ctx.stream.cu_stream(),
-        );
-    }
-}
-
-/// Slots of the conv input stride by the tensor's own row width, so `x` may be
-/// the qkv band of a fused qkv+z projection. The conv output is this operator's
-/// own buffer and keeps the band's width as its slot stride.
-pub(crate) fn conv1d_decode_batch_into<'a>(
-    ctx: &DeviceContext,
-    x: impl Into<Columns<'a>>,
-    conv_weight: &DeviceVec,
-    conv_state_ptrs: &CudaSlice<u64>,
-    out: &mut HiddenStates,
-    kernel_size: usize,
-) {
-    let x = x.into();
-    x.assert_in_row("conv1d_decode x");
-    let batch_size = x.states.seq_len;
-    let num_channels = x.width;
-    assert_eq!(out.hidden_dim, num_channels);
-    assert_eq!(out.seq_len, batch_size);
-    assert_eq!(conv_weight.len, num_channels * kernel_size);
-    assert!(kernel_size <= LINEAR_CONV_MAX_KERNEL_DIM);
-    assert!(conv_state_ptrs.len() >= batch_size);
-
-    let (x_ptr, _gx) = x.states.data.device_ptr(&ctx.stream);
-    let x_ptr = x_ptr + (x.col * std::mem::size_of::<half::bf16>()) as u64;
-    let (w_ptr, _gw) = conv_weight.data.device_ptr(&ctx.stream);
-    let (s_ptrs, _gs) = conv_state_ptrs.device_ptr(&ctx.stream);
-    let (o_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
-
-    unsafe {
-        ffi::conv1d_decode_batch_cuda(
-            x_ptr as *const ffi::Half,
-            w_ptr as *const ffi::Half,
-            s_ptrs as *const u64,
-            o_ptr as *mut ffi::Half,
-            num_channels as i32,
-            x.states.hidden_dim as i32,
-            batch_size as i32,
-            kernel_size as i32,
             ctx.stream.cu_stream(),
         );
     }
@@ -568,6 +458,7 @@ pub fn gated_delta_rule_prefill_chunkwise_into(
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
+    use cudarc::driver::CudaSlice;
     use cudarc::driver::DevicePtrMut;
     use half::bf16;
     use pegainfer_core::tensor::DeviceContext;
@@ -575,9 +466,10 @@ mod tests {
     use pegainfer_core::tensor::HiddenStates;
 
     use super::conv1d_prefill_batch_into;
-    use super::gated_delta_rule_decode_batch_into;
     use super::gated_delta_rule_decode_vec_into;
     use super::gated_delta_rule_prefill_chunkwise_into;
+    use crate::ops::conv1d_decode_batch_into;
+    use crate::ops::gated_delta_rule_decode_batch_into;
     use crate::prefill_buffers::GdrChunkwiseScratch35;
 
     fn bf16_vec(data: &[f32]) -> Vec<bf16> {
@@ -718,6 +610,152 @@ mod tests {
 
         assert!(max_out_diff < 0.02, "output diff {max_out_diff}");
         assert!(max_state_diff < 0.02, "state diff {max_state_diff}");
+        Ok(())
+    }
+
+    /// One decode step of the conv1d kernel's documented recurrence:
+    /// `silu(bf16(Σ_k w[k] * [state[0], state[1], state[2], x]))`, followed by
+    /// shifting the state to the previous inputs, oldest first.
+    fn reference_conv1d_decode_step(x: &[bf16], weights: &[bf16], state: &mut [f32]) -> Vec<bf16> {
+        let channels = x.len();
+        let kernel_size = weights.len() / channels;
+        let width = kernel_size - 1;
+        let mut out = vec![bf16::ZERO; channels];
+        for c in 0..channels {
+            let mut sum = 0.0f32;
+            for k in 0..kernel_size {
+                let value = if k == kernel_size - 1 {
+                    x[c].to_f32()
+                } else {
+                    state[c * width + k]
+                };
+                sum += value * weights[c * kernel_size + k].to_f32();
+            }
+            let sum_bf16 = bf16::from_f32(sum).to_f32();
+            out[c] = bf16::from_f32(sum_bf16 / (1.0 + (-sum_bf16).exp()));
+        }
+        for c in 0..channels {
+            for i in 0..width {
+                state[c * width + i] = if i + 1 < width {
+                    state[c * width + i + 1]
+                } else {
+                    x[c].to_f32()
+                };
+            }
+        }
+        out
+    }
+
+    /// Steps between two finite bf16 values on the bf16 grid, with +0 and -0 as
+    /// one point.
+    fn bf16_ulp_distance(a: bf16, b: bf16) -> u32 {
+        let ordered = |value: bf16| {
+            let bits = i32::from(value.to_bits());
+            if bits & 0x8000 != 0 {
+                -(bits & 0x7fff)
+            } else {
+                bits
+            }
+        };
+        ordered(a).abs_diff(ordered(b))
+    }
+
+    #[test]
+    fn conv1d_decode_batch_matches_reference_steps() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        let num_channels = 10240usize;
+        let kernel_size = 4usize;
+        let state_width = kernel_size - 1;
+        let batch_size = 3usize;
+
+        let w_host = bf16_vec(
+            &(0..num_channels * kernel_size)
+                .map(|i| ((i % 37) as f32 - 18.0) * 0.015_625)
+                .collect::<Vec<_>>(),
+        );
+        let conv_weight = DeviceVec::from_host(&ctx, &w_host)?;
+
+        // Distinct initial states with identical inputs: a shared or mis-indexed
+        // state pointer would make slots 1 and 2 drift from their own reference.
+        let state_len = num_channels * state_width;
+        let initial: Vec<Vec<bf16>> = (0..batch_size)
+            .map(|slot| {
+                bf16_vec(
+                    &(0..state_len)
+                        .map(|i| ((i + slot * 7) % 23) as f32 * 0.01 - 0.11)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        let mut host_states: Vec<Vec<f32>> = initial
+            .iter()
+            .map(|values| values.iter().map(|value| value.to_f32()).collect())
+            .collect();
+        let mut slots: Vec<CudaSlice<bf16>> = initial
+            .iter()
+            .map(|values| ctx.stream.clone_htod(values))
+            .collect::<std::result::Result<_, _>>()?;
+
+        let mut pointers = Vec::with_capacity(batch_size);
+        for slot in &mut slots {
+            let (pointer, _guard) = slot.device_ptr_mut(&ctx.stream);
+            pointers.push(pointer);
+        }
+        let state_ptrs = ctx.stream.clone_htod(&pointers)?;
+
+        for step in 0..kernel_size + 2 {
+            let row = bf16_vec(
+                &(0..num_channels)
+                    .map(|i| (((i * 13 + step * 29) % 101) as f32 - 50.0) * 0.007_812_5)
+                    .collect::<Vec<_>>(),
+            );
+            let x_host: Vec<bf16> = (0..batch_size).flat_map(|_| row.clone()).collect();
+            let x = HiddenStates {
+                data: ctx.stream.clone_htod(&x_host)?,
+                hidden_dim: num_channels,
+                seq_len: batch_size,
+            };
+            let mut out = HiddenStates::zeros(&ctx, num_channels, batch_size)?;
+            conv1d_decode_batch_into(&ctx, &x, &conv_weight, &state_ptrs, &mut out, kernel_size);
+            ctx.sync()?;
+
+            let got: Vec<bf16> = ctx.stream.clone_dtoh(&out.data)?;
+            for slot in 0..batch_size {
+                let expected = reference_conv1d_decode_step(&row, &w_host, &mut host_states[slot]);
+                let got_row = &got[slot * num_channels..(slot + 1) * num_channels];
+                assert!(
+                    got_row
+                        .iter()
+                        .chain(&expected)
+                        .all(|value| value.to_f32().is_finite()),
+                    "conv1d decode step {step} slot {slot}: non-finite output"
+                );
+                let max_ulps = got_row
+                    .iter()
+                    .zip(&expected)
+                    .map(|(got, expected)| bf16_ulp_distance(*got, *expected))
+                    .max()
+                    .unwrap_or_default();
+                assert!(
+                    max_ulps <= 1,
+                    "conv1d decode step {step} slot {slot}: output off by {max_ulps} bf16 ulps"
+                );
+            }
+
+            // The state is the previous inputs oldest-first, bit for bit.
+            for (slot, values) in slots.iter().enumerate() {
+                let device: Vec<bf16> = ctx.stream.clone_dtoh(values)?;
+                ctx.sync()?;
+                let expected: Vec<bf16> = host_states[slot]
+                    .iter()
+                    .map(|value| bf16::from_f32(*value))
+                    .collect();
+                assert_eq!(
+                    device, expected,
+                    "conv1d decode step {step} slot {slot}: state"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -1100,7 +1138,7 @@ mod tests {
             }
             let ptrs = ctx.stream.clone_htod(&ptrs)?;
             let mut out = HiddenStates::zeros(&ctx, qkv_dim, batch_size)?;
-            super::conv1d_decode_batch_into(&ctx, x, &conv_weight, &ptrs, &mut out, kernel_size);
+            conv1d_decode_batch_into(&ctx, x, &conv_weight, &ptrs, &mut out, kernel_size);
             let out_host = ctx.stream.clone_dtoh(&out.data)?;
             let mut state_host = Vec::with_capacity(batch_size * state_len);
             for state in &states {
