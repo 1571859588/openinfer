@@ -848,8 +848,7 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
                 queries: self.prefix_cache_queries,
                 // hits = local hits + host (connector) hits; the bridge derives
                 // local hits as `hits - host_hits` for `vllm:prefix_cache_hits`.
-                hits: self.prefix_cache_hits
-                    + self.executor.connector_lookup_counters().hits,
+                hits: self.prefix_cache_hits + self.executor.connector_lookup_counters().hits,
                 // External (connector) hits map to host_queries/host_hits in
                 // the upstream struct; the bridge routes them to
                 // vllm:external_prefix_cache_*.

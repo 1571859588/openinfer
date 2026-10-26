@@ -49,7 +49,7 @@ const ZERO_COST_MODEL_NAME: &str = "pegainfer-sim-zero-cost";
 /// draft tokens each verify step accepts.
 const SPEC_K: usize = 3;
 const SPEC_ACCEPTED: usize = 2;
-const PREFIX_METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-prefix-metrics";
+const PREFIX_SIM_METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-prefix-sim-metrics";
 const ABORT_METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-abort-metrics";
 const PREFIX_MISS_METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-prefix-miss-metrics";
 const PREFIX_LOGPROBS_MODEL_NAME: &str = "pegainfer-sim-e2e-prefix-logprobs-metrics";
@@ -106,7 +106,7 @@ impl SimServer {
     /// request, so the stepped bridge has prefix-cache counters (local and
     /// external) to stamp onto its batches.
     async fn spawn_with_prefix_cache() -> Result<Self> {
-        Self::spawn_with_prefix_cache_as(PREFIX_METRICS_MODEL_NAME).await
+        Self::spawn_with_prefix_cache_as(PREFIX_SIM_METRICS_MODEL_NAME).await
     }
 
     /// As `spawn_with_prefix_cache`, under a caller-chosen model name. Each

@@ -9,6 +9,7 @@ use anyhow::ensure;
 use pegainfer_frontend::engine::Engine;
 use pegainfer_frontend::engine::EngineInfo;
 use pegainfer_frontend::engine::FinishReason;
+use pegainfer_frontend::engine::PrefixCacheCounters;
 use pegainfer_frontend::engine::PromptEcho;
 use pegainfer_frontend::engine::QueuedRequest;
 use pegainfer_frontend::engine::RejectReason;
@@ -218,6 +219,18 @@ struct PrefixCacheTally {
 }
 
 impl PrefixCacheTally {
+    /// The engine-contract snapshot. `hits` there counts every tier, so the
+    /// externally restored tokens join the local ones; `host_*` carry the
+    /// connector family on its own.
+    fn counters(&self) -> PrefixCacheCounters {
+        PrefixCacheCounters {
+            queries: self.queries,
+            hits: self.hits + self.external_hits,
+            host_queries: self.external_queries,
+            host_hits: self.external_hits,
+        }
+    }
+
     /// Tally one admitted request's prefix lookup.
     ///
     /// `knob` is the simulated lookup: `(local hits, externally restored hits)`.
@@ -631,26 +644,29 @@ impl Scheduler for SimScheduler {
             // counters are tallied on admission whichever lane admits the
             // request, so both lanes report them the same way.
             let mut metrics = profiled.metrics(self.spec_decode.as_ref());
-            metrics.prefix_cache_queries = self.prefix_cache.queries;
-            metrics.prefix_cache_hits = self.prefix_cache.hits;
-            metrics.prefix_cache_external_queries = self.prefix_cache.external_queries;
-            metrics.prefix_cache_external_hits = self.prefix_cache.external_hits;
+            metrics.prefix_cache = self.prefix_cache_counters();
             return metrics;
         }
         SchedulerMetrics {
             num_running_reqs: self.running.len() as u64,
             num_waiting_reqs: self.queued.len() as u64,
             spec_decode: self.spec_decode,
-            prefix_cache_queries: self.prefix_cache.queries,
-            prefix_cache_hits: self.prefix_cache.hits,
-            prefix_cache_external_queries: self.prefix_cache.external_queries,
-            prefix_cache_external_hits: self.prefix_cache.external_hits,
+            prefix_cache: self.prefix_cache_counters(),
             ..SchedulerMetrics::default()
         }
     }
 }
 
 impl SimScheduler {
+    /// `None` without a configured prefix cache: the contract reserves a
+    /// counter set for engines that have one, and a sim that pretends to look
+    /// nothing up must not publish zeros as if it did.
+    fn prefix_cache_counters(&self) -> Option<PrefixCacheCounters> {
+        self.config
+            .prefix_cache
+            .map(|_| self.prefix_cache.counters())
+    }
+
     fn step_legacy(&mut self, ledger: &mut RequestLedger) -> Result<()> {
         for QueuedRequest { id, request } in self.queued.drain(..) {
             if ledger.is_aborted(id) {
