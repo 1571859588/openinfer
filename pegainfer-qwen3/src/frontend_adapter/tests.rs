@@ -631,7 +631,7 @@ fn arrivals_during_inflight_prefill_leave_its_kv_tail() {
 ///    `PrefixCacheStats`, so `hit_rate = hits/queries` stays in [0, 1];
 ///  * cumulative-counter double counting — every request is counted exactly
 ///    once, on its first prefill chunk; the totals-to-deltas conversion the
-///    bridge applies (and why) lives on `PrefixCacheTracker`.
+///    bridge applies (and why) lives on `StatsTracker`.
 #[test]
 fn prefix_cache_metrics_stable_across_batches_and_scrapes() {
     const BATCHES: u64 = 4;
@@ -675,7 +675,7 @@ fn prefix_cache_metrics_stable_across_batches_and_scrapes() {
         );
         let m = partition.handle.metrics();
         let pc = m.prefix_cache.unwrap_or_default();
-        scrapes.push((batch, pc.queries, pc.hits - pc.host_hits));
+        scrapes.push((batch, pc.queries, pc.hits - pc.external_unspecified_hits));
     }
 
     // Drain the step stream so the driver thread can exit cleanly.
@@ -691,10 +691,10 @@ fn prefix_cache_metrics_stable_across_batches_and_scrapes() {
     // TOTAL * those, and hit_rate = HIT_TOKENS / PROMPT_TOKENS in [0, 1].
     let expected_q = TOTAL * PROMPT_TOKENS;
     // Hits are the local share only — what the connector restored is carried
-    // by the external family (host_hits) instead.
+    // by the external family (external_unspecified_hits) instead.
     let expected_local_h = TOTAL * (HIT_TOKENS - EXTERNAL_HIT_TOKENS);
     assert_eq!(apc.queries, expected_q);
-    let local_hits = apc.hits - apc.host_hits;
+    let local_hits = apc.hits - apc.external_unspecified_hits;
     assert_eq!(local_hits, expected_local_h);
     assert!(
         apc.hits <= apc.queries,
@@ -711,7 +711,9 @@ fn prefix_cache_metrics_stable_across_batches_and_scrapes() {
         apc.host_queries,
         TOTAL * (PROMPT_TOKENS - (HIT_TOKENS - EXTERNAL_HIT_TOKENS))
     );
-    assert_eq!(apc.host_hits, TOTAL * EXTERNAL_HIT_TOKENS);
+    // The connector cannot say which tier answered, so nothing is `host`.
+    assert_eq!(apc.host_hits, 0);
+    assert_eq!(apc.external_unspecified_hits, TOTAL * EXTERNAL_HIT_TOKENS);
 
     // Each batch contributed a stable, non-zero delta of exactly
     // PER_BATCH * PROMPT_TOKENS (queries) and PER_BATCH * the LOCAL hits:

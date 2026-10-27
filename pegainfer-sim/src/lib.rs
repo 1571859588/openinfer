@@ -200,7 +200,7 @@ pub fn start_engine_with_partitions(config: &SimulatedEngineConfig, partitions: 
 /// Cumulative prefix-cache lookups, in tokens.
 ///
 /// The scheduler holds running totals; the bridge converts them to per-send
-/// deltas before they reach Prometheus (see `PrefixCacheTracker`).
+/// deltas before they reach Prometheus (see `StatsTracker`).
 ///
 /// Both counters are token-granular, and the external family exists only for a
 /// request whose connector was consulted — mirroring vLLM, which registers
@@ -220,14 +220,16 @@ struct PrefixCacheTally {
 
 impl PrefixCacheTally {
     /// The engine-contract snapshot. `hits` there counts every tier, so the
-    /// externally restored tokens join the local ones; `host_*` carry the
-    /// connector family on its own.
+    /// externally restored tokens join the local ones. Like the qwen3 engine
+    /// it mimics, the sim's connector cannot name the tier that answered, so
+    /// its restores are `external_unspecified` rather than `host`.
     fn counters(&self) -> PrefixCacheCounters {
         PrefixCacheCounters {
             queries: self.queries,
             hits: self.hits + self.external_hits,
             host_queries: self.external_queries,
-            host_hits: self.external_hits,
+            external_unspecified_hits: self.external_hits,
+            ..PrefixCacheCounters::default()
         }
     }
 

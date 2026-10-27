@@ -831,6 +831,7 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
     fn metrics(&self) -> SchedulerMetrics {
         // The external family lives on the executor: a connector lookup is
         // settled there whether or not its request ever reaches a prefill.
+        let connector = self.executor.connector_lookup_counters();
         SchedulerMetrics {
             kv_used_blocks: self
                 .kv_total
@@ -846,14 +847,19 @@ impl<E: ModelExecutor> Scheduler for Qwen3Scheduler<E> {
             spec_decode: self.executor.spec_decode_counters(),
             prefix_cache: Some(pegainfer_frontend::engine::PrefixCacheCounters {
                 queries: self.prefix_cache_queries,
-                // hits = local hits + host (connector) hits; the bridge derives
-                // local hits as `hits - host_hits` for `vllm:prefix_cache_hits`.
-                hits: self.prefix_cache_hits + self.executor.connector_lookup_counters().hits,
-                // External (connector) hits map to host_queries/host_hits in
-                // the upstream struct; the bridge routes them to
-                // vllm:external_prefix_cache_*.
-                host_queries: self.executor.connector_lookup_counters().queries,
-                host_hits: self.executor.connector_lookup_counters().hits,
+                // hits = local hits + connector hits; the bridge derives the
+                // local ones as `hits - external hits` for
+                // `vllm:prefix_cache_hits`.
+                hits: self.prefix_cache_hits + connector.hits,
+                // The connector's lookups ride `host_queries`, the family's
+                // source-agnostic query count. A connector query returns only
+                // a block count: it can be answered from host memory, a P2P
+                // peer or SSD, and nothing says which. So the hits are
+                // `external_unspecified`, not `host`, which would mislabel the
+                // peer and disk restores.
+                host_queries: connector.queries,
+                external_unspecified_hits: connector.hits,
+                ..pegainfer_frontend::engine::PrefixCacheCounters::default()
             }),
         }
     }

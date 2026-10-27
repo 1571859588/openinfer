@@ -49,7 +49,6 @@ const ZERO_COST_MODEL_NAME: &str = "pegainfer-sim-zero-cost";
 /// draft tokens each verify step accepts.
 const SPEC_K: usize = 3;
 const SPEC_ACCEPTED: usize = 2;
-const PREFIX_SIM_METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-prefix-sim-metrics";
 const ABORT_METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-abort-metrics";
 const PREFIX_MISS_METRICS_MODEL_NAME: &str = "pegainfer-sim-e2e-prefix-miss-metrics";
 const PREFIX_LOGPROBS_MODEL_NAME: &str = "pegainfer-sim-e2e-prefix-logprobs-metrics";
@@ -104,15 +103,10 @@ impl SimServer {
 
     /// A single engine that reports a scripted prefix lookup on every admitted
     /// request, so the stepped bridge has prefix-cache counters (local and
-    /// external) to stamp onto its batches.
-    async fn spawn_with_prefix_cache() -> Result<Self> {
-        Self::spawn_with_prefix_cache_as(PREFIX_SIM_METRICS_MODEL_NAME).await
-    }
-
-    /// As `spawn_with_prefix_cache`, under a caller-chosen model name. Each
-    /// server gets its own name because they share one process-wide Prometheus
-    /// registry: two tests driving the same `model_name` would add into the
-    /// same series and each would then see the other's totals.
+    /// external) to stamp onto its batches. Each server gets its own name
+    /// because they share one process-wide Prometheus registry: two tests
+    /// driving the same `model_name` would add into the same series and each
+    /// would then see the other's totals.
     async fn spawn_with_prefix_cache_as(model_name: &'static str) -> Result<Self> {
         Self::spawn_with_config(
             model_dir_with_minimal_metadata()?,
@@ -124,7 +118,7 @@ impl SimServer {
         .await
     }
 
-    /// As above, but the scripted lookup matches nothing, so the counters must
+    /// As `spawn_with_prefix_cache_as`, but the scripted lookup matches nothing, so the counters must
     /// show a query with no hit rather than a cache that was never asked.
     async fn spawn_with_miss_prefix_cache() -> Result<Self> {
         Self::spawn_with_config(
@@ -723,62 +717,6 @@ async fn stepped_bridge_reports_spec_decode_counters_to_prometheus() -> Result<(
     server.shutdown().await
 }
 
-/// The four prefix-cache families reach Prometheus through the stepped bridge:
-/// one lookup per admitted request, split into a local hit and an
-/// externally-restored hit. A hit of 0 (a miss) still counts its query, which
-/// is what keeps the hit rate honest instead of pinned at 100%.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stepped_bridge_reports_prefix_cache_counters_to_prometheus() -> Result<()> {
-    let server = SimServer::spawn_with_prefix_cache().await?;
-    let client = test_client()?;
-
-    let body = json!({
-        "model": server.model_name,
-        "prompt": vec![1u32; PREFIX_PROMPT],
-        "max_tokens": 1,
-        "temperature": 0.0,
-        "ignore_eos": true,
-    });
-    client
-        .post(format!("{}/v1/completions", server.base_url))
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(body.to_string())
-        .send()
-        .await?
-        .error_for_status()?;
-
-    let queries = PREFIX_PROMPT as f64;
-    // vLLM measures the connector query as what the local cache did not
-    // answer, so a locally cached token is not in the external denominator.
-    let external_queries = (PREFIX_PROMPT - PREFIX_LOCAL_HITS) as f64;
-    wait_for_metrics(
-        &client,
-        &server.base_url,
-        &[
-            ("vllm:prefix_cache_queries_total", "0", queries),
-            (
-                "vllm:prefix_cache_hits_total",
-                "0",
-                PREFIX_LOCAL_HITS as f64,
-            ),
-            (
-                "vllm:external_prefix_cache_queries_total",
-                "0",
-                external_queries,
-            ),
-            (
-                "vllm:external_prefix_cache_hits_total",
-                "0",
-                PREFIX_EXTERNAL_HITS as f64,
-            ),
-        ],
-        &server.model_name,
-    )
-    .await?;
-
-    server.shutdown().await
-}
-
 /// A request that is admitted and then aborted produces no tokens to carry its
 /// prefix delta: only the cached-token metadata record, then nothing. The
 /// stepped bridge still has to ship that delta in a stats-only batch, or the
@@ -1273,6 +1211,7 @@ impl Scheduler for TieredPrefixCacheScheduler {
             self.totals.hits += turn.hits;
             self.totals.host_queries += turn.host_queries;
             self.totals.host_hits += turn.host_hits;
+            self.totals.external_unspecified_hits += turn.external_unspecified_hits;
             ledger.push_tokens(id, &[0], &[]);
             ledger.finish(id, FinishReason::Length);
         }
@@ -1288,11 +1227,13 @@ impl Scheduler for TieredPrefixCacheScheduler {
     }
 }
 
-/// A scheduler that serves hits from both tiers reaches `/metrics` with the
+/// A scheduler that serves hits from several tiers reaches `/metrics` with the
 /// split intact: device hits in `vllm:prefix_cache_*` and `source="device"`,
-/// host lookups and hits in `vllm:external_prefix_cache_*` and
-/// `source="host"`. The frontend credits every local hit to device, so a host
-/// hit carried as a local one would export as device.
+/// connector lookups and hits in `vllm:external_prefix_cache_*`, labeled
+/// `source="host"` when the engine knows the tier and
+/// `source="external_unspecified"` when it cannot say. The frontend credits
+/// every local hit to device, so an external hit carried as a local one would
+/// export as device.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stepped_bridge_reports_prefix_cache_hits_by_tier_to_prometheus() -> Result<()> {
     let scheduler = TieredPrefixCacheScheduler {
@@ -1309,6 +1250,17 @@ async fn stepped_bridge_reports_prefix_cache_hits_by_tier_to_prometheus() -> Res
                 hits: 4096,
                 host_queries: 1280,
                 host_hits: 1024,
+                ..PrefixCacheCounters::default()
+            },
+            // A turn whose connector restored 512 tokens from a tier it cannot
+            // name: 2048 looked up, 1024 resident on device; the 1024 that
+            // missed device went to the connector.
+            PrefixCacheCounters {
+                queries: 2048,
+                hits: 1536,
+                host_queries: 1024,
+                external_unspecified_hits: 512,
+                ..PrefixCacheCounters::default()
             },
         ]
         .into_iter(),
@@ -1321,7 +1273,7 @@ async fn stepped_bridge_reports_prefix_cache_hits_by_tier_to_prometheus() -> Res
     )
     .await?;
     let client = test_client()?;
-    for _ in 0..2 {
+    for _ in 0..3 {
         post_completion(&client, &base_url, PREFIX_METRICS_MODEL_NAME, false).await?;
     }
 
@@ -1329,10 +1281,10 @@ async fn stepped_bridge_reports_prefix_cache_hits_by_tier_to_prometheus() -> Res
         &client,
         &base_url,
         &[
-            ("vllm:prefix_cache_queries_total", "0", 8448.0),
-            ("vllm:prefix_cache_hits_total", "0", 3072.0),
-            ("vllm:external_prefix_cache_queries_total", "0", 1280.0),
-            ("vllm:external_prefix_cache_hits_total", "0", 1024.0),
+            ("vllm:prefix_cache_queries_total", "0", 10496.0),
+            ("vllm:prefix_cache_hits_total", "0", 4096.0),
+            ("vllm:external_prefix_cache_queries_total", "0", 2304.0),
+            ("vllm:external_prefix_cache_hits_total", "0", 1536.0),
         ],
         PREFIX_METRICS_MODEL_NAME,
     )
@@ -1345,13 +1297,19 @@ async fn stepped_bridge_reports_prefix_cache_hits_by_tier_to_prometheus() -> Res
                 "vllm:prompt_tokens_cached_by_source_total",
                 "0",
                 &[("source", "device")][..],
-                3072.0,
+                4096.0,
             ),
             (
                 "vllm:prompt_tokens_cached_by_source_total",
                 "0",
                 &[("source", "host")][..],
                 1024.0,
+            ),
+            (
+                "vllm:prompt_tokens_cached_by_source_total",
+                "0",
+                &[("source", "external_unspecified")][..],
+                512.0,
             ),
         ],
         PREFIX_METRICS_MODEL_NAME,
