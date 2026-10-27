@@ -202,6 +202,7 @@ impl LocalQwen3Lane {
         results: &[VerifyRequestResult],
         captured_hidden: Option<&HiddenStates>,
         verify_round: u64,
+        gated: bool,
     ) -> Result<()> {
         let Some(captured_hidden) = captured_hidden else {
             anyhow::bail!("DFlash verify context capture requested but no hidden states returned");
@@ -252,11 +253,14 @@ impl LocalQwen3Lane {
             } else {
                 dflash.accepted_draft_tokens as f64 / dflash.verified_draft_tokens as f64
             };
+            let verified_draft = req.token_ids.len().saturating_sub(1);
             log::debug!(
-                "Qwen3 DFlash context round={} request={} accepted_draft={} committed_tokens={} context_len={} cumulative_accept_rate={:.3}",
+                "Qwen3 DFlash context round={} request={} accepted_draft={} verified_draft={} gated={} committed_tokens={} context_len={} cumulative_accept_rate={:.3}",
                 verify_round,
                 req.request_id,
                 result.matched_draft_tokens,
+                verified_draft,
+                u8::from(gated),
                 result.accepted_tokens.len(),
                 context_len,
                 rate,
@@ -268,7 +272,11 @@ impl LocalQwen3Lane {
                 .iter()
                 .map(|result| result.accepted_tokens.len())
                 .sum();
-            controller.tick(dflash.round_chains, committed);
+            if gated {
+                controller.break_window();
+            } else {
+                controller.tick(dflash.round_chains, committed);
+            }
         }
         Ok(())
     }
@@ -475,6 +483,7 @@ impl LocalQwen3Lane {
             // Anchor-first checkpoints use every sample. Prepend the actual
             // dangling token once for all three paths before target verification.
             let drafts_start = usize::from(!selector && !model.anchor_first());
+            let keep = model.effective_drafts();
             let mut outputs = Vec::with_capacity(requests.len());
             for (i, req) in requests.iter().enumerate() {
                 let block = &sampled[i * sampled_stride..(i + 1) * sampled_stride];
@@ -485,9 +494,15 @@ impl LocalQwen3Lane {
                     i,
                     block_size
                 );
-                let mut token_ids = Vec::with_capacity(drafts.len() + 1);
+                anyhow::ensure!(
+                    keep <= drafts.len(),
+                    "draft trim {} exceeds the block's {} draft tokens",
+                    keep,
+                    drafts.len()
+                );
+                let mut token_ids = Vec::with_capacity(keep + 1);
                 token_ids.push(req.current_token);
-                token_ids.extend(drafts.iter().copied());
+                token_ids.extend(drafts[..keep].iter().copied());
                 outputs.push(DraftRequestResult {
                     request_id: req.request_id,
                     token_ids,

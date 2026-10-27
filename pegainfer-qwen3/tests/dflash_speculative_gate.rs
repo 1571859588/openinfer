@@ -1226,3 +1226,153 @@ fn hedged_ladder_passes_the_lossless_gates() {
     assert!(total_wins > 0);
     assert!(total_spans > total_wins);
 }
+
+/// Parse the executor's per-round trace into
+/// `(round, request, gated, verified drafts, accepted drafts)`. `RequestId`
+/// renders as `req-<n>`, so each field takes the first non-empty digit run
+/// after the field name.
+fn levers_trace_rows(stderr: &str) -> Vec<(u64, u64, bool, usize, usize)> {
+    let mut out = Vec::new();
+    for line in stderr.lines() {
+        if !line.contains("Qwen3 DFlash context round=") {
+            continue;
+        }
+        let field = |name: &str| -> u64 {
+            line.split(name)
+                .nth(1)
+                .and_then(|rest| {
+                    rest.split(|ch: char| !ch.is_ascii_digit())
+                        .find(|token| !token.is_empty())
+                })
+                .and_then(|token| token.parse().ok())
+                .unwrap_or_else(|| panic!("missing {name} in trace line: {line}"))
+        };
+        out.push((
+            field("round="),
+            field("request="),
+            field("gated=") == 1,
+            field("verified_draft=") as usize,
+            field("accepted_draft=") as usize,
+        ));
+    }
+    out
+}
+
+/// Losslessness and reach under the two load levers.
+///
+/// Both knobs are read once per process from the environment, so a normal test
+/// cannot vary them per case. This gate re-execs itself (the hedged gate's
+/// pattern) once per configuration and checks the child's lossless pass *and*
+/// the executor's per-round trace:
+///
+/// - `PEGAINFER_SPEC_MAX_BATCH=1` gates every round (the batch is always >= 1),
+///   so the one-token verify path is the only path exercised;
+/// - `PEGAINFER_SPEC_MAX_DRAFTS=4/2` must keep the greedy and concurrent gates
+///   green, and no round may verify more drafts than the cap;
+/// - `PEGAINFER_SPEC_MAX_BATCH=3` on the heterogeneous concurrent batch (four
+///   staggered budgets): the batch shrinks below the threshold mid-run, and a
+///   request that was gated must later accept drafts.
+#[test]
+fn dflash_spec_levers_keep_losslessness() {
+    const GREEDY: &str = "dflash_speculative_greedy_matches_plain_greedy";
+    const CONCURRENT: &str = "dflash_concurrent_heterogeneous_is_lossless";
+
+    let (Some(_), Some(_)) = (target_path_or_skip(), draft_path_or_skip()) else {
+        return;
+    };
+    let _gpu = GPU
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let exe = std::env::current_exe().expect("test binary path");
+
+    let run_child = |child_test: &str, envs: &[(&str, &str)]| -> String {
+        let mut command = Command::new(&exe);
+        command
+            .args(["--exact", child_test, "--test-threads=1", "--nocapture"])
+            .env("PEGAINFER_TEST_LOG", "1")
+            .env_remove("PEGAINFER_SPEC_MAX_BATCH")
+            .env_remove("PEGAINFER_SPEC_MAX_DRAFTS")
+            .env_remove("PEGAINFER_SPEC_HEDGE")
+            .env_remove("PEGAINFER_SPEC_HEDGE_AUTO")
+            .env_remove("PEGAINFER_SPEC_HEDGE_POSITIONS")
+            .env_remove("PEGAINFER_SPEC_HEDGE_KNEE");
+        for &(key, value) in envs {
+            command.env(key, value);
+        }
+        let output = command
+            .output()
+            .unwrap_or_else(|e| panic!("spawn child gate '{child_test}': {e}"));
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            output.status.success(),
+            "child gate '{child_test}' failed with {envs:?}:\n{}\n{stderr}",
+            String::from_utf8_lossy(&output.stdout),
+        );
+        stderr
+    };
+
+    // Every step gated: the one-token round must reproduce plain greedy.
+    let trace = run_child(GREEDY, &[("PEGAINFER_SPEC_MAX_BATCH", "1")]);
+    let trace_rows = levers_trace_rows(&trace);
+    let gated = trace_rows.iter().filter(|row| row.2).count();
+    let drafting = trace_rows.iter().filter(|row| !row.2 && row.3 > 0).count();
+    eprintln!(
+        "spec lever gate: child={GREEDY} env=MAX_BATCH=1 gated_rows={gated} \
+         speculating_rows={drafting}"
+    );
+    assert!(
+        gated > 0
+            && drafting == 0
+            && trace_rows
+                .iter()
+                .all(|row| row.2 && row.3 == 0 && row.4 <= 1),
+        "PEGAINFER_SPEC_MAX_BATCH=1 still speculated (gated={gated}, drafting={drafting}):\n{trace}"
+    );
+
+    // Trimmed spans stay lossless, and no round verifies more than the cap.
+    for cap in ["4", "2"] {
+        let cap_len: usize = cap.parse().expect("numeric draft cap");
+        for child_test in [GREEDY, CONCURRENT] {
+            let trace = run_child(child_test, &[("PEGAINFER_SPEC_MAX_DRAFTS", cap)]);
+            let trace_rows = levers_trace_rows(&trace);
+            let drafting = trace_rows.iter().filter(|row| !row.2 && row.3 > 0).count();
+            let max_drafts = trace_rows.iter().map(|row| row.3).max().unwrap_or(0);
+            eprintln!(
+                "spec lever gate: child={child_test} env=MAX_DRAFTS={cap} gated_rows=0 \
+                 speculating_rows={drafting} max_drafts={max_drafts}"
+            );
+            assert!(
+                trace_rows.iter().all(|row| !row.2),
+                "the gate must stay off when only MAX_DRAFTS is set:\n{trace}"
+            );
+            assert!(
+                drafting > 0 && max_drafts <= cap_len,
+                "trim K={cap} on '{child_test}' verified {max_drafts} drafts \
+                 (drafting rounds={drafting}):\n{trace}"
+            );
+        }
+    }
+
+    // Resume, checked per request: aggregate counts cannot show it.
+    let trace = run_child(CONCURRENT, &[("PEGAINFER_SPEC_MAX_BATCH", "3")]);
+    let trace_rows = levers_trace_rows(&trace);
+    let gated = trace_rows.iter().filter(|row| row.2).count();
+    let drafting = trace_rows.iter().filter(|row| !row.2 && row.3 > 0).count();
+    eprintln!(
+        "spec lever gate: child={CONCURRENT} env=MAX_BATCH=3 gated_rows={gated} \
+         speculating_rows={drafting}"
+    );
+    let resumed = trace_rows.iter().enumerate().any(|(index, row)| {
+        !row.2
+            && row.3 > 0
+            && row.4 > 0
+            && trace_rows[..index]
+                .iter()
+                .any(|earlier| earlier.1 == row.1 && earlier.2)
+    });
+    assert!(
+        gated > 0 && drafting > 0 && resumed,
+        "no request was gated and then later accepted drafts \
+         (gated={gated}, drafting={drafting}):\n{trace}"
+    );
+}
